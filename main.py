@@ -1,16 +1,49 @@
+# -*- coding: utf-8 -*-
 import os, io, re, time, math, requests
 import pandas as pd
-from datetime import datetime
 
-# ========= CONFIG / CONSTANTS =========
-ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "").strip()
+# ================== CONFIG ==================
 HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"}
+os.makedirs("data", exist_ok=True)
+
+# Seasons (update when needed)
+CURR_SEASON = "20242025"
+LAST_SEASON = "20232024"
+
+# League baselines / knobs
+LEAGUE_AVG_SV = 0.905
+GOALIE_SKATER_DAMPEN_MAX = 0.10     # cap ±10% on skater G/A from goalie effect
+GOALIE_SKATER_DAMPEN_WEIGHT = 0.25  # how strongly SV% diff → dampener
+GOALIE_TOI_MIN = 60.0               # goalie minutes for projections
+
+FALLBACK_SF60 = 31.0
+FALLBACK_xGF60 = 2.95
+
+SETTINGS = {
+    "DK_points": {"Goal": 8.5, "Assist": 5.0, "SOG": 1.5, "Block": 1.3},
+    "LineMult_byType": {
+        "5v5 Line 1": 1.12, "5v5 Line 2": 1.04, "5v5 Line 3": 0.97, "5v5 Line 4": 0.92,
+        "D Pair 1": 1.05, "D Pair 2": 1.00, "D Pair 3": 0.96,
+        "PP1": 1.12, "PP2": 1.03, "PK1": 0.92, "PK2": 0.95
+    },
+    # Gentle rookie/low-sample priors
+    "F_fallback": {"G60": 0.45, "A60": 0.80, "SOG60": 5.0, "BLK60": 1.0},
+    "D_fallback": {"G60": 0.20, "A60": 0.70, "SOG60": 3.2, "BLK60": 4.0},
+    # Opp factors (neutral for now unless you wire team-defense)
+    "Opp_SOG_factor": 1.00,
+    "Opp_xGA_factor": 1.00,
+    "Opp_CA_factor":  1.00,
+    # polite throttling
+    "sleep_nst": 3.5,
+    "sleep_lines": 2.0
+}
 
 TEAMS = [
     "ANA","UTA","BOS","BUF","CGY","CAR","CHI","COL","CBJ","DAL","DET","EDM","FLA",
     "LAK","MIN","MTL","NSH","NJD","NYI","NYR","OTT","PHI","PIT","SJS","SEA","STL",
     "TBL","TOR","VAN","VGK","WSH","WPG"
 ]
+# DFO slugs (Utah Mammoth included)
 DFO_SLUG = {
     "ANA":"ducks","UTA":"utah-mammoth","BOS":"bruins","BUF":"sabres","CGY":"flames",
     "CAR":"hurricanes","CHI":"blackhawks","COL":"avalanche","CBJ":"blue-jackets","DAL":"stars",
@@ -21,38 +54,31 @@ DFO_SLUG = {
     "WSH":"capitals","WPG":"jets"
 }
 
-SETTINGS = {
-    # If a player lacks NST data (rookie/low sample), we backfill with gentle priors
-    "F_fallback": {"G60": 0.45, "A60": 0.80, "SOG60": 5.0, "BLK60": 1.0},
-    "D_fallback": {"G60": 0.20, "A60": 0.70, "SOG60": 3.2, "BLK60": 4.0},
-    # TOI defaults (until you wire real TOI model)
-    "TOI_default": {"F": 16.0, "D": 22.0},
-    # Line multipliers (chemistry baseline)
-    "LineMult_byType": {
-        "5v5 Line 1": 1.08, "5v5 Line 2": 1.03, "5v5 Line 3": 0.98, "5v5 Line 4": 0.94,
-        "D Pair 1": 1.05, "D Pair 2": 1.00, "D Pair 3": 0.96,
-        "PP1": 1.12, "PP2": 1.03, "PK1": 0.92, "PK2": 0.95
-    },
-    # Opponent neutral factors (1.0) — can be replaced later with NST team-defense inputs
-    "Opp_SOG_factor": 1.00,
-    "Opp_xGA_factor": 1.00,
-    "Opp_CA_factor":  1.00,
-    # DraftKings scoring
-    "DK_points": {"Goal": 8.5, "Assist": 5.0, "SOG": 1.5, "Block": 1.3},
-    # polite throttling
-    "sleep_nst": 4.0,
-    "sleep_lines": 2.0
-}
-
-os.makedirs("data", exist_ok=True)
-
-
-# ========= HELPERS =========
+# ================== HELPERS ==================
 def norm_name(s: str) -> str:
-    s = re.sub(r"[\u2013\u2014\u2019]", "-", str(s))      # normalize dashes/quotes
-    s = re.sub(r"[^A-Za-z0-9\-\' ]+", " ", s)            # strip weird chars
+    s = re.sub(r"[\u2013\u2014\u2019]", "-", str(s))
+    s = re.sub(r"[^A-Za-z0-9\-\' ]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip().upper()
     return s
+
+def clamp(val, lo, hi):
+    return max(lo, min(hi, val))
+
+def light_goalie_dampener(weighted_sv):
+    if pd.isna(weighted_sv) or weighted_sv <= 0 or weighted_sv >= 1:
+        return 0.0
+    adj = (LEAGUE_AVG_SV - float(weighted_sv)) * GOALIE_SKATER_DAMPEN_WEIGHT
+    return clamp(adj, -GOALIE_SKATER_DAMPEN_MAX, GOALIE_SKATER_DAMPEN_MAX)
+
+def blend_three_layer(stat_recent, stat_season, stat_lastyear, w_recent=0.50, w_season=0.35, w_last=0.15):
+    vals = [stat_recent, stat_season, stat_lastyear]
+    if all(pd.isna(v) for v in vals):
+        return None
+    r = 0.0; totw = 0.0
+    if pd.notna(stat_recent): r += w_recent * stat_recent; totw += w_recent
+    if pd.notna(stat_season): r += w_season * stat_season; totw += w_season
+    if pd.notna(stat_lastyear): r += w_last * stat_lastyear; totw += w_last
+    return r / totw if totw > 0 else None
 
 def guess_role_from_pos(pos: str) -> str:
     if not isinstance(pos, str): return "F"
@@ -61,181 +87,156 @@ def guess_role_from_pos(pos: str) -> str:
     if "D" in p: return "D"
     return "F"
 
+# ================== DRAFTKINGS (light) ==================
+def fetch_dk_salaries_csv_if_present() -> pd.DataFrame:
+    """
+    Reads data/dk_salaries.csv (recommended daily export).
+    If you have a DK fetcher elsewhere, keep writing to this path.
+    """
+    p = "data/dk_salaries.csv"
+    if os.path.exists(p):
+        try: return pd.read_csv(p)
+        except Exception as e:
+            print("DK CSV read error:", e)
+    print("WARNING: data/dk_salaries.csv not found; projections will be sparse.")
+    return pd.DataFrame(columns=["Name","TeamAbbrev","Position","Salary"])
 
-# ========= SCRAPE: DraftKings Salaries =========
-def fetch_dk_salaries() -> pd.DataFrame:
-    try:
-        url = "https://www.draftkings.com/lobby/getcontests?sport=NHL"
-        r = requests.get(url, headers=HEADERS, timeout=40)
-        r.raise_for_status()
-        contests = r.json().get("Contests", [])
-        def looks_classic(c):
-            for k in ("ContestType","Type","contestType","ContestName","Name","name"):
-                v = c.get(k)
-                if isinstance(v, str) and "classic" in v.lower():
-                    return True
-            return False
-        classic = [c for c in contests if looks_classic(c)]
-        if not classic and contests:
-            classic = [contests[0]]
+# ================== NST SCRAPERS ==================
+def _nst_get(url):
+    r = requests.get(url, headers=HEADERS, timeout=60)
+    return r
 
-        dfs = []
-        for c in classic:
-            cid = c.get("ContestId")
-            if not cid: continue
-            csv_url = f"https://www.draftkings.com/lineup/getavailableplayerscsv?contestId={cid}"
-            cr = requests.get(csv_url, headers=HEADERS, timeout=50)
-            if cr.status_code != 200: continue
-            df = pd.read_csv(io.StringIO(cr.text))
-            df.insert(0, "Contest", c.get("ContestName",""))
-            dfs.append(df)
-        out = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-        if not out.empty:
-            # Normalize column names we care about
-            ren = {}
-            for col in out.columns:
-                lc = col.lower()
-                if lc == "name": ren[col] = "Name"
-                if lc == "teamabbrev": ren[col] = "TeamAbbrev"
-                if lc == "position": ren[col] = "Position"
-                if lc == "salary": ren[col] = "Salary"
-            out = out.rename(columns=ren)
-        return out
-    except Exception as e:
-        print("DK error:", e)
-        return pd.DataFrame()
+def _parse_nst_player_rows(html):
+    """
+    Parse NST player table rows into list of dicts with per-60 columns if present.
+    This is regex-based but resilient; falls back to None if a column is not found.
+    """
+    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.IGNORECASE|re.DOTALL)
+    out = []
+    for row in rows:
+        m_name = re.search(r'player(?:\.php\?id=|id=)\d+[^>]*>([^<]+)</a>', row, flags=re.IGNORECASE)
+        if not m_name: 
+            continue
+        pname = m_name.group(1).strip()
 
-
-# ========= SCRAPE: Odds API =========
-def fetch_odds() -> pd.DataFrame:
-    if not ODDS_API_KEY:
-        return pd.DataFrame([{"Error": "Missing ODDS_API_KEY"}])
-    try:
-        url = (
-            "https://api.the-odds-api.com/v4/sports/icehockey_nhl/odds/"
-            f"?regions=us&markets=h2h,totals,player_points,player_assists,player_goals&oddsFormat=decimal&apiKey={ODDS_API_KEY}"
-        )
-        r = requests.get(url, headers=HEADERS, timeout=50)
-        if r.status_code != 200:
-            return pd.DataFrame([{"Error": f"{r.status_code}", "Body": r.text[:250]}])
-        data = r.json()
-        rows = []
-        for game in data:
-            matchup = f"{game.get('home_team','')} vs {game.get('away_team','')}"
-            t = game.get("commence_time","")
-            for bk in game.get("bookmakers",[]):
-                bkey = bk.get("key","")
-                for mk in bk.get("markets",[]):
-                    mkey = mk.get("key","")
-                    for out in mk.get("outcomes",[]):
-                        rows.append({
-                            "Game": matchup,
-                            "Market": mkey,
-                            "Outcome": out.get("name",""),
-                            "Odds": out.get("price",""),
-                            "Bookmaker": bkey,
-                            "CommenceTimeUTC": t
-                        })
-        return pd.DataFrame(rows)
-    except Exception as e:
-        print("Odds error:", e)
-        return pd.DataFrame()
-
-
-# ========= SCRAPE: NST Per-Player Stats (per-60) =========
-# Pulls per-team player table and extracts common per-60s and danger/xG context.
-# Endpoint pattern: https://www.naturalstattrick.com/playerteams.php?team=TOR&sit=all
-def fetch_nst_player_stats() -> pd.DataFrame:
-    cols = ["Player","Team","GP","TOI","G/60","A/60","SOG/60","BLK/60","CF/60","CA/60","xGF/60","xGA/60","HDCF/60","HDCA/60"]
-    all_rows = []
-    for abbr in TEAMS:
-        url = f"https://www.naturalstattrick.com/playerteams.php?team={abbr}&sit=all"
-        # Utah Mammoth fallback (if NST hasn’t updated code yet)
-        if abbr == "UTA":
-            r = requests.get(url, headers=HEADERS, timeout=50)
-            if r.status_code != 200:
-                url = "https://www.naturalstattrick.com/playerteams.php?team=ARI&sit=all"
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=50)
-            if r.status_code != 200:
-                print(f"NST stats HTTP {r.status_code} for {abbr}")
-                time.sleep(SETTINGS["sleep_nst"]); continue
-            html = r.text
-            # Rough row parse: capture table rows that include player link, then grab columns nearby
-            # We'll pull names and then search per-60 numeric columns following the row.
-            # Fallback: find all player anchors, then search rightward for numeric per-60s.
-            players = re.findall(r'player(?:\.php\?id=|id=)\d+[^>]*>([^<]+)</a>', html, flags=re.IGNORECASE)
-            # Grab all numbers that look like per-60 stats; later we align by heuristic (best-effort)
-            # Better approach would be full HTML table parsing with BeautifulSoup; kept regexy to stay lightweight.
-            rows_text = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.IGNORECASE|re.DOTALL)
-            # Build a quick map Player -> row_text
-            plist = []
-            for row in rows_text:
-                m = re.search(r'player(?:\.php\?id=|id=)\d+[^>]*>([^<]+)</a>', row, flags=re.IGNORECASE)
-                if m:
-                    pname = m.group(1).strip()
-                    plist.append((pname, row))
-
-            def pick_num(pattern, s):
-                m = re.search(pattern, s, flags=re.IGNORECASE)
+        def pick_num(label):
+            # try label/60 variants
+            pats = [
+                rf'{label}\s*/\s*60[^0-9\-]*([0-9]*\.?[0-9]+)',
+                rf'{label}60[^0-9\-]*([0-9]*\.?[0-9]+)',
+                rf'{label}[^0-9\-]*([0-9]*\.?[0-9]+)'
+            ]
+            for pat in pats:
+                m = re.search(pat, row, flags=re.IGNORECASE)
                 if m:
                     try: return float(m.group(1))
-                    except: return None
-                return None
+                    except: pass
+            return None
 
-            for pname, row in plist:
-                # Heuristics: find per-60 columns by nearby titles or numeric positions
-                # We try multiple patterns; if nothing, leave as None
-                # (These patterns should be adapted if NST markup shifts.)
-                g60   = pick_num(r'G/60[^0-9\-]*([0-9]*\.?[0-9]+)', row)
-                a60   = pick_num(r'A/60[^0-9\-]*([0-9]*\.?[0-9]+)', row)
-                sog60 = pick_num(r'(?:S|Shots)/60[^0-9\-]*([0-9]*\.?[0-9]+)', row)
-                blk60 = pick_num(r'Blk/60[^0-9\-]*([0-9]*\.?[0-9]+)', row)
-                cf60  = pick_num(r'CF/60[^0-9\-]*([0-9]*\.?[0-9]+)', row)
-                ca60  = pick_num(r'CA/60[^0-9\-]*([0-9]*\.?[0-9]+)', row)
-                xgf60 = pick_num(r'xGF/60[^0-9\-]*([0-9]*\.?[0-9]+)', row)
-                xga60 = pick_num(r'xGA/60[^0-9\-]*([0-9]*\.?[0-9]+)', row)
-                hdcf60= pick_num(r'HDCF/60[^0-9\-]*([0-9]*\.?[0-9]+)', row)
-                hdca60= pick_num(r'HDCA/60[^0-9\-]*([0-9]*\.?[0-9]+)', row)
-                toistr= re.search(r'(?:TOI|TOI/GP)[^0-9]*([0-9]*\.?[0-9]+)', row, flags=re.IGNORECASE)
-                toival= float(toistr.group(1)) if toistr else None
+        g60   = pick_num("G")
+        a60   = pick_num("A")
+        sog60 = pick_num("(?:S|Shots)")
+        blk60 = pick_num("Blk")
+        cf60  = pick_num("CF")
+        ca60  = pick_num("CA")
+        xgf60 = pick_num("xGF")
+        xga60 = pick_num("xGA")
+        hdcf60= pick_num("HDCF")
+        hdca60= pick_num("HDCA")
+        toistr= None
+        for lab in ("TOI/GP","TOI"):
+            m = re.search(rf'{lab}[^0-9]*([0-9]*\.?[0-9]+)', row, flags=re.IGNORECASE)
+            if m: 
+                toistr = m.group(1)
+                break
+        toival= float(toistr) if toistr else None
+        out.append({
+            "Player": pname, "G/60": g60, "A/60": a60, "SOG/60": sog60, "BLK/60": blk60,
+            "CF/60": cf60, "CA/60": ca60, "xGF/60": xgf60, "xGA/60": xga60,
+            "HDCF/60": hdcf60, "HDCA/60": hdca60, "TOI": toival
+        })
+    return out
+
+def fetch_nst_player_stats_multi() -> pd.DataFrame:
+    """
+    For EACH team, fetch player tables for:
+      - This Season
+      - Recent (last 10 games)
+      - Last Season
+    Then three-layer blend per-60s: recent / season / last.
+    """
+    all_rows = []
+    for abbr in TEAMS:
+        # Utah Mammoth NST may still use ARI in some places; try UTA then fallback ARI.
+        team_code_list = [abbr] if abbr != "UTA" else ["UTA","ARI"]
+        for team_code in team_code_list:
+            # ---- This season ----
+            url_season = f"https://www.naturalstattrick.com/playerteams.php?team={team_code}&sit=all&fromseason={CURR_SEASON}&thruseason={CURR_SEASON}"
+            r = _nst_get(url_season)
+            if r.status_code != 200:
+                print(f"NST season {abbr} HTTP {r.status_code}")
+                continue
+            season_rows = _parse_nst_player_rows(r.text)
+            if not season_rows and team_code == "UTA":
+                continue  # try fallback ARI in next loop
+            # index by name
+            by_name = {norm_name(x["Player"]): x for x in season_rows}
+
+            # ---- Recent last 10 ----
+            url_recent = f"https://www.naturalstattrick.com/playerteams.php?team={team_code}&sit=all&fromseason={CURR_SEASON}&thruseason={CURR_SEASON}&tgp=10"
+            r2 = _nst_get(url_recent); time.sleep(SETTINGS["sleep_nst"])
+            recent_rows = _parse_nst_player_rows(r2.text) if r2.status_code == 200 else []
+            by_name_recent = {norm_name(x["Player"]): x for x in recent_rows}
+
+            # ---- Last season ----
+            url_last = f"https://www.naturalstattrick.com/playerteams.php?team={team_code}&sit=all&fromseason={LAST_SEASON}&thruseason={LAST_SEASON}"
+            r3 = _nst_get(url_last); time.sleep(SETTINGS["sleep_nst"])
+            last_rows = _parse_nst_player_rows(r3.text) if r3.status_code == 200 else []
+            by_name_last = {norm_name(x["Player"]): x for x in last_rows}
+
+            # blend
+            for nkey, srow in by_name.items():
+                name = srow["Player"]
+                rrow = by_name_recent.get(nkey, {})
+                lrow = by_name_last.get(nkey, {})
+
+                def b3(col):
+                    return blend_three_layer(
+                        rrow.get(col), srow.get(col), lrow.get(col)
+                    )
 
                 all_rows.append({
-                    "Player": pname.strip(),
                     "Team": abbr,
-                    "GP": None,
-                    "TOI": toival,
-                    "G/60": g60, "A/60": a60, "SOG/60": sog60, "BLK/60": blk60,
-                    "CF/60": cf60, "CA/60": ca60, "xGF/60": xgf60, "xGA/60": xga60,
-                    "HDCF/60": hdcf60, "HDCA/60": hdca60,
-                    "NameKey": f"{abbr}_{norm_name(pname)}"
+                    "Player": name,
+                    "NameKey": f"{abbr}_{norm_name(name)}",
+                    "G/60": b3("G/60"),
+                    "A/60": b3("A/60"),
+                    "SOG/60": b3("SOG/60"),
+                    "BLK/60": b3("BLK/60"),
+                    "CF/60": b3("CF/60"),
+                    "CA/60": b3("CA/60"),
+                    "xGF/60": b3("xGF/60"),
+                    "xGA/60": b3("xGA/60"),
+                    "HDCF/60": b3("HDCF/60"),
+                    "HDCA/60": b3("HDCA/60"),
+                    "TOI": srow.get("TOI")  # keep season TOI/GP as a rough base
                 })
-            time.sleep(SETTINGS["sleep_nst"])
-        except Exception as e:
-            print(f"NST stats err for {abbr}:", e)
-            time.sleep(SETTINGS["sleep_nst"])
-            continue
-
+            break  # succeeded for this team (UTA or fallback ARI)
     df = pd.DataFrame(all_rows)
-    # Drop rows with no player name
-    df = df[df["Player"].astype(str).str.len() > 0]
     return df
 
-
-# ========= SCRAPE: DFO → LWL Lines (and build line lists) =========
-def parse_fixed_blocks(names):
-    # Assumes order on page; robust enough for our purposes
+# ================== LINES (DFO → LWL fallback) ==================
+def _parse_fixed_blocks(names):
     layout = [
         ("5v5 Line 1", 3), ("5v5 Line 2", 3), ("5v5 Line 3", 3), ("5v5 Line 4", 3),
         ("D Pair 1", 2), ("D Pair 2", 2), ("D Pair 3", 2),
-        ("PP1", 5), ("PP2", 5),
-        ("PK1", 4), ("PK2", 4)
+        ("PP1", 5), ("PP2", 5), ("PK1", 4), ("PK2", 4)
     ]
     out, idx = [], 0
     for typ, size in layout:
         group = names[idx:idx+size]; idx += size
         if len(group) == size:
-            out.append((typ, " – ".join(group)))
+            out.append((typ, " – ".join([g.strip() for g in group])))
     return out
 
 def fetch_lines_df() -> pd.DataFrame:
@@ -243,30 +244,30 @@ def fetch_lines_df() -> pd.DataFrame:
     for abbr in TEAMS:
         got = False
         slug = DFO_SLUG.get(abbr, "")
-        # Try DFO
+        # DFO
         try:
             if slug:
                 url = f"https://www.dailyfaceoff.com/teams/{slug}/line-combinations/"
-                r = requests.get(url, headers=HEADERS, timeout=45)
+                r = requests.get(url, headers=HEADERS, timeout=50)
                 if r.status_code == 200:
                     names = re.findall(r'data-player-name="([^"]+)"', r.text)
                     names = [n.strip() for n in names]
                     if names:
-                        for typ, players in parse_fixed_blocks(names):
+                        for typ, players in _parse_fixed_blocks(names):
                             rows.append({"Team": abbr, "Line Type": typ, "Line ID": f"{abbr}_{typ}", "Players": players, "Source": "DFO"})
                         got = True
         except Exception:
             pass
-        # Fallback LWL
+        # LWL fallback
         if not got:
             try:
                 url = f"https://www.leftwinglock.com/line-combinations/team.php?team={abbr}"
-                r = requests.get(url, headers=HEADERS, timeout=45)
+                r = requests.get(url, headers=HEADERS, timeout=50)
                 if r.status_code == 200:
                     names = re.findall(r'<td class="line-combination-player">([^<]+)', r.text)
                     names = [n.strip() for n in names]
                     if names:
-                        for typ, players in parse_fixed_blocks(names):
+                        for typ, players in _parse_fixed_blocks(names):
                             rows.append({"Team": abbr, "Line Type": typ, "Line ID": f"{abbr}_{typ}", "Players": players, "Source": "LWL"})
                         got = True
             except Exception:
@@ -277,7 +278,6 @@ def fetch_lines_df() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 def explode_line_players(lines_df: pd.DataFrame) -> pd.DataFrame:
-    # Split "A – B – C" into rows
     def split_players(s):
         return [p.strip() for p in re.split(r"–|-|,|\u2013", str(s)) if p.strip()]
     out = []
@@ -293,48 +293,114 @@ def explode_line_players(lines_df: pd.DataFrame) -> pd.DataFrame:
             })
     return pd.DataFrame(out)
 
-
-# ========= LINE CHEMISTRY from NST + Lines =========
 def build_line_chemistry(nst_players: pd.DataFrame, lines_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    For each Line ID, aggregate NST per-60 of the unit (sum where appropriate).
-    We'll compute:
-      - G/60, A/60, SOG/60, BLK/60 (sum of the unit’s members)
-      - xGF/60, xGA/60, CF/60, CA/60, HDCF/60, HDCA/60 (sum)
-    These become line-level multipliers / context.
-    """
     if nst_players is None or nst_players.empty or lines_df is None or lines_df.empty:
         return pd.DataFrame()
-
     lp = explode_line_players(lines_df)
     if lp.empty: return pd.DataFrame()
 
     # Join NST stats onto each line-player
     nst = nst_players.copy()
-    # Index by PlayerKey to join
     nst["PlayerKey"] = nst.apply(lambda r: f"{r.get('Team','')}_{norm_name(r.get('Player',''))}", axis=1)
-
     merged = lp.merge(
         nst[["PlayerKey","G/60","A/60","SOG/60","BLK/60","CF/60","CA/60","xGF/60","xGA/60","HDCF/60","HDCA/60"]],
         on="PlayerKey", how="left"
     )
-
     # Aggregate per line
     agg = merged.groupby(["Team","Line ID","Line Type"], dropna=False).agg({
         "G/60":"sum","A/60":"sum","SOG/60":"sum","BLK/60":"sum",
         "CF/60":"sum","CA/60":"sum","xGF/60":"sum","xGA/60":"sum",
         "HDCF/60":"sum","HDCA/60":"sum"
     }).reset_index()
-
-    # Attach line multiplier defaults
     agg["Base Line Multiplier"] = agg["Line Type"].map(SETTINGS["LineMult_byType"]).fillna(1.0)
-
     return agg
 
+# ================== GOALIES (NST) ==================
+def parse_nst_goalie_table(html):
+    """
+    Parse NST goalie table for SV%. Tries to find rows with a player (goalie) link and SV% column.
+    Returns list of dicts: {"Goalie": name, "SV": sv_as_fraction}
+    """
+    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.IGNORECASE|re.DOTALL)
+    out = []
+    for row in rows:
+        m = re.search(r'goalie(?:\.php\?id=|id=)\d+[^>]*>([^<]+)</a>', row, flags=re.IGNORECASE)
+        if not m:
+            # many NST tables don’t use separate goalie link; fallback to generic anchor
+            m = re.search(r'player(?:\.php\?id=|id=)\d+[^>]*>([^<]+)</a>', row, flags=re.IGNORECASE)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        # find SV% value
+        msv = re.search(r'(?:SV%|SV)\s*</?[^>]*>\s*([0-9]{1,2}\.?[0-9]*)', row, flags=re.IGNORECASE)
+        sv = None
+        if msv:
+            try:
+                v = float(msv.group(1))
+                sv = v/100.0 if v > 1.5 else v
+            except:
+                sv = None
+        if sv is not None:
+            out.append({"Goalie": name, "SV": sv})
+    return out
 
-# ========= PROJECTIONS (line-aware, opponent-neutral baseline) =========
-def build_projections(dk_df: pd.DataFrame, nst_players: pd.DataFrame, lines_df: pd.DataFrame, line_chem: pd.DataFrame):
-    if dk_df is None or dk_df.empty:  # must have DK
+def fetch_nst_goalie_sv_three_layer() -> pd.DataFrame:
+    """
+    Pull SV% for Last 10 (recent), This Season, Last Season; three-layer blend per goalie.
+    NST has a goalies table; paths vary, so we try multiple endpoints.
+    """
+    def get_table(from_season, thru_season, tgp=None):
+        # Try a couple of common endpoints; stop at first success with data.
+        qs = f"fromseason={from_season}&thruseason={thru_season}&sit=all"
+        if tgp: qs += f"&tgp={tgp}"
+        urls = [
+            f"https://www.naturalstattrick.com/goalies.php?{qs}",
+            f"https://www.naturalstattrick.com/playerlist.php?{qs}&pos=G"  # fallback attempt
+        ]
+        for u in urls:
+            try:
+                r = _nst_get(u)
+                if r.status_code == 200:
+                    rows = parse_nst_goalie_table(r.text)
+                    if rows:
+                        return rows
+            except Exception:
+                pass
+        return []
+
+    # season
+    season = get_table(CURR_SEASON, CURR_SEASON)
+    time.sleep(SETTINGS["sleep_nst"])
+    # recent last 10
+    recent = get_table(CURR_SEASON, CURR_SEASON, tgp=10)
+    time.sleep(SETTINGS["sleep_nst"])
+    # last season
+    last = get_table(LAST_SEASON, LAST_SEASON)
+    time.sleep(SETTINGS["sleep_nst"])
+
+    by_name_s = {norm_name(x["Goalie"]): x["SV"] for x in season}
+    by_name_r = {norm_name(x["Goalie"]): x["SV"] for x in recent}
+    by_name_l = {norm_name(x["Goalie"]): x["SV"] for x in last}
+
+    names = set(by_name_s.keys()) | set(by_name_r.keys()) | set(by_name_l.keys())
+    rows = []
+    for n in names:
+        wsv = blend_three_layer(by_name_r.get(n), by_name_s.get(n), by_name_l.get(n))
+        if wsv is None:
+            wsv = LEAGUE_AVG_SV
+        rows.append({"Goalie_norm": n, "Weighted_SV": wsv})
+    return pd.DataFrame(rows)
+
+# ================== PROJECTIONS ==================
+def build_projections(dk_df: pd.DataFrame,
+                      nst_players: pd.DataFrame,
+                      lines_df: pd.DataFrame,
+                      line_chem: pd.DataFrame):
+    """
+    Skaters: line-aware, opponent-neutral (for now); light goalie dampener placeholder (league avg).
+    Goalies: built separately with NST three-layer SV% and opponent proxies.
+    """
+    if dk_df is None or dk_df.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     dk = dk_df.copy()
@@ -346,44 +412,38 @@ def build_projections(dk_df: pd.DataFrame, nst_players: pd.DataFrame, lines_df: 
         if lc == "position": ren[c] = "Position"
         if lc == "salary": ren[c] = "DK Salary"
     dk = dk.rename(columns=ren)
-    keep = [c for c in ["Name","Team","Position","DK Salary"] if c in dk.columns]
-    dk = dk[keep].copy()
 
     # Split skaters / goalies
     sk = dk[~dk["Position"].str.contains("G", case=False, na=False)].copy()
     gk = dk[ dk["Position"].str.contains("G", case=False, na=False)].copy()
 
-    # Join NST per-player onto skaters
+    # Attach NST blended per-60s to skaters
     if nst_players is not None and not nst_players.empty:
         nst = nst_players.copy()
         nst["PlayerKey"] = nst.apply(lambda r: f"{r.get('Team','')}_{norm_name(r.get('Player',''))}", axis=1)
-        sk["PlayerKey"]   = sk.apply(lambda r: f"{r.get('Team','')}_{norm_name(r.get('Name',''))}", axis=1)
+        sk["PlayerKey"]  = sk.apply(lambda r: f"{r.get('Team','')}_{norm_name(r.get('Name',''))}", axis=1)
         sk = sk.merge(nst[["PlayerKey","G/60","A/60","SOG/60","BLK/60"]], on="PlayerKey", how="left")
     else:
         sk["G/60"] = sk["A/60"] = sk["SOG/60"] = sk["BLK/60"] = None
 
-    # Fallback for missing NST player rows (rookies)
+    # Fallbacks for rookies / missing
     def backfill_rates(row):
         role = guess_role_from_pos(row.get("Position",""))
         base = SETTINGS["D_fallback"] if role=="D" else SETTINGS["F_fallback"]
         return pd.Series({
-            "G/60": row["G/60"] if pd.notna(row["G/60"]) else base["G60"],
-            "A/60": row["A/60"] if pd.notna(row["A/60"]) else base["A60"],
+            "G/60":   row["G/60"]   if pd.notna(row["G/60"])   else base["G60"],
+            "A/60":   row["A/60"]   if pd.notna(row["A/60"])   else base["A60"],
             "SOG/60": row["SOG/60"] if pd.notna(row["SOG/60"]) else base["SOG60"],
             "BLK/60": row["BLK/60"] if pd.notna(row["BLK/60"]) else base["BLK60"]
         })
-    rates = sk.apply(backfill_rates, axis=1)
-    sk[["G/60","A/60","SOG/60","BLK/60"]] = rates
+    sk[["G/60","A/60","SOG/60","BLK/60"]] = sk.apply(backfill_rates, axis=1)
 
-    # Attach lines to skaters (5v5 + PP)
+    # Lines (5v5 + PP) and chemistry
     if lines_df is not None and not lines_df.empty:
         lp = explode_line_players(lines_df)
-        # 5v5 line
         fivev5 = lp[lp["Line Type"].str.startswith("5v5", na=False)].copy()
-        # PP line
-        ppl    = lp[lp["Line Type"].str.startswith("PP", na=False)].copy()
-
-        # Join by PlayerKey
+        ppl    = lp[lp["Line Type"].str.startswith("PP",   na=False)].copy()
+        # join
         sk = sk.merge(fivev5[["PlayerKey","Line Type","Line ID"]].rename(
             columns={"Line Type":"Line","Line ID":"Line ID_5v5"}), on="PlayerKey", how="left")
         sk = sk.merge(ppl[["PlayerKey","Line Type","Line ID"]].rename(
@@ -391,104 +451,81 @@ def build_projections(dk_df: pd.DataFrame, nst_players: pd.DataFrame, lines_df: 
     else:
         sk["Line"] = ""; sk["Line ID_5v5"] = ""; sk["PP Line"] = ""; sk["PP Line ID"] = ""
 
-    # Line multiplier from unit type (default 1.0)
-    sk["Line Multiplier (xGF)"] = sk["Line"].map(SETTINGS["LineMult_byType"]).fillna(1.0)
-
-    # Expected TOI (minutes)
-    sk["Expected TOI (min)"] = sk["Position"].apply(lambda p: SETTINGS["TOI_default"]["D"] if "D" in str(p).upper() else SETTINGS["TOI_default"]["F"])
-    toi_ratio = pd.to_numeric(sk["Expected TOI (min)"], errors="coerce").fillna(0) / 60.0
-
-    # Opponent factors (wire team-defense later)
-    sk["Opp_SOG_factor"] = SETTINGS["Opp_SOG_factor"]
-    sk["Opp_xGA_factor"] = SETTINGS["Opp_xGA_factor"]
-    sk["Opp_CA_factor"]  = SETTINGS["Opp_CA_factor"]
-    sk["PP_Edge"] = sk["PP Line"].apply(lambda x: 1.10 if x in ("PP1","PP2") else 1.0)
-
-    # Line chemistry influence:
-    # Map each player’s 5v5 Line ID to line-level xGF/60 sum (normalize to 3 forwards by design)
+    # Chemistry multiplier (base)
     if line_chem is not None and not line_chem.empty:
-        chem = line_chem[["Line ID","Line Type","xGF/60","xGA/60","CF/60","CA/60","HDCF/60","HDCA/60","G/60","A/60","SOG/60","BLK/60","Base Line Multiplier"]].copy()
-        chem = chem.rename(columns={"Line ID":"Line ID_5v5"})
-        sk = sk.merge(chem, on="Line ID_5v5", how="left", suffixes=("","_LINE"))
-        # Chemistry multiplier: blend Base Line Multiplier with relative line xGF signal
-        # Normalize line xGF/60 by a soft baseline (e.g., 5.0 for a trio); tweakable later
+        chem = line_chem.rename(columns={"Line ID":"Line ID_5v5"})
+        sk = sk.merge(chem[["Line ID_5v5","Line Type","xGF/60","SOG/60","Base Line Multiplier"]],
+                      on="Line ID_5v5", how="left", suffixes=("","_LINE"))
         sk["Chemistry Mult"] = sk["Base Line Multiplier"].fillna(1.0) * (1.0 + ((sk["xGF/60"].fillna(5.0) - 5.0) / 25.0))
     else:
         sk["Chemistry Mult"] = 1.0
 
-    # Raw per-60 → projections
-    sk["Proj Goals (raw)"]   = sk["G/60"]   * toi_ratio
-    sk["Proj Assists (raw)"] = sk["A/60"]   * toi_ratio
-    sk["Proj SOG (raw)"]     = sk["SOG/60"] * toi_ratio
-    sk["Proj Blocks (raw)"]  = sk["BLK/60"] * toi_ratio
+    # TOI splits (coarse defaults; replace later if you wire detailed TOI/PP data)
+    sk["TOI_5v5"] = sk["Position"].apply(lambda p: 15.0 if "D" not in str(p).upper() else 19.0)
+    sk["TOI_PP"]  = sk["PP Line"].apply(lambda pp: 3.6 if pp in ("PP1","PP2") else 1.0)
+    sk["TOI_PK"]  =  sk["Position"].apply(lambda p: 1.0 if "D" in str(p).upper() else 0.4)
 
-    # Adjusted with opponent + line + chemistry
-    sk["Adj Proj Goals"]   = sk["Proj Goals (raw)"]   * sk["Opp_xGA_factor"] * sk["Line Multiplier (xGF)"] * sk["PP_Edge"] * sk["Chemistry Mult"]
-    sk["Adj Proj Assists"] = sk["Proj Assists (raw)"] * sk["Opp_xGA_factor"] * sk["Line Multiplier (xGF)"] * sk["PP_Edge"] * sk["Chemistry Mult"]
-    sk["Adj Proj SOG"]     = sk["Proj SOG (raw)"]     * sk["Opp_SOG_factor"] * sk["Line Multiplier (xGF)"] * sk["Chemistry Mult"]
-    sk["Adj Proj Blocks"]  = sk["Proj Blocks (raw)"]  * (0.5 + 0.5*sk["Opp_CA_factor"])
+    toi5  = pd.to_numeric(sk["TOI_5v5"], errors="coerce").fillna(0)/60.0
+    toipp = pd.to_numeric(sk["TOI_PP"],  errors="coerce").fillna(0)/60.0
+    toipk = pd.to_numeric(sk["TOI_PK"],  errors="coerce").fillna(0)/60.0
+
+    # Opponent factors (neutral until you add schedule/team-defense)
+    sk["Opp_SOG_factor"] = SETTINGS["Opp_SOG_factor"]
+    sk["Opp_xGA_factor"] = SETTINGS["Opp_xGA_factor"]
+    sk["Opp_CA_factor"]  = SETTINGS["Opp_CA_factor"]
+
+    # Base situation-blended projections (5v5 + PP for G/A/SOG; PK for BLK)
+    sk["Proj Goals (base)"]   = sk["G/60"]   * (toi5 + toipp*0.9)
+    sk["Proj Assists (base)"] = sk["A/60"]   * (toi5 + toipp*1.0)
+    sk["Proj SOG (base)"]     = sk["SOG/60"] * (toi5 + toipp*1.1)
+    sk["Proj Blocks (base)"]  = sk["BLK/60"] * (toi5 + toipk*1.4)
+
+    # Apply chemistry & opponent factors
+    sk["Proj Goals (chem)"]   = sk["Proj Goals (base)"]   * sk["Chemistry Mult"] * sk["Opp_xGA_factor"]
+    sk["Proj Assists (chem)"] = sk["Proj Assists (base)"] * sk["Chemistry Mult"] * sk["Opp_xGA_factor"]
+    sk["Proj SOG (chem)"]     = sk["Proj SOG (base)"]     * sk["Chemistry Mult"] * sk["Opp_SOG_factor"]
+    sk["Proj Blocks (chem)"]  = sk["Proj Blocks (base)"]  * (0.5 + 0.5*sk["Opp_CA_factor"])
+
+    # Light goalie dampener (we don’t know exact starter here → use league avg as a tiny nudge)
+    sk["Goalie_Damp"] = light_goalie_dampener(LEAGUE_AVG_SV)
+    sk["Adj Proj Goals"]   = sk["Proj Goals (chem)"]   * (1.0 + sk["Goalie_Damp"])
+    sk["Adj Proj Assists"] = sk["Proj Assists (chem)"] * (1.0 + sk["Goalie_Damp"])
+    sk["Adj Proj SOG"]     = sk["Proj SOG (chem)"]
+    sk["Adj Proj Blocks"]  = sk["Proj Blocks (chem)"]
 
     # DK points & value
     pts = SETTINGS["DK_points"]
+    salary = pd.to_numeric(sk["DK Salary"], errors="coerce")
     sk["Projected DK Points"] = (
         sk["Adj Proj Goals"]*pts["Goal"] +
         sk["Adj Proj Assists"]*pts["Assist"] +
         sk["Adj Proj SOG"]*pts["SOG"] +
         sk["Adj Proj Blocks"]*pts["Block"]
     )
-    salary = pd.to_numeric(sk["DK Salary"], errors="coerce")
     sk["DFS Value Score"] = (sk["Projected DK Points"] / salary.replace(0, math.nan)) * 1000.0
-    sk["Proj Points (raw)"] = (
-        sk["Proj Goals (raw)"]*pts["Goal"] +
-        sk["Proj Assists (raw)"]*pts["Assist"] +
-        sk["Proj SOG (raw)"]*pts["SOG"] +
-        sk["Proj Blocks (raw)"]*pts["Block"]
-    )
 
-    # Final DFS projections in your exact column order
-    desired = [
-        "Name","Team","", "Position","Line","PP Line","Expected TOI (min)","DK Salary",
-        "","","","","","","","","","","","",  # placeholders for LxG/LxD/Season columns you may add later
-        "G/60","A/60","SOG/60","BLK/60",
-        "Opp_SOG_factor","Opp_xGA_factor","Opp_CA_factor","PP_Edge",
-        "Proj Goals (raw)","Proj Assists (raw)","Proj SOG (raw)","Proj Blocks (raw)",
-        "Projected DK Points","DFS Value Score","Proj Points (raw)","Line ID_5v5","Line Multiplier (xGF)",
-        "Adj Proj Goals","Adj Proj Assists","Adj Proj SOG"
-    ]
-    # Build a mapping to your labeled headers:
-    rename_for_sheet = {
-        "Name":"Player",
-        "": "Opponent",  # left blank; you can wire opponent mapping later
-        "G/60":"Weighted Goals/60",
-        "A/60":"Weighted Assists/60",
-        "SOG/60":"Weighted SOG/60",
-        "BLK/60":"Weighted Blocks/60"
-    }
-    sk = sk.rename(columns=rename_for_sheet)
-    # Ensure all expected columns exist
+    # Final columns for DFS Projections
     cols = [
-        "Player","Team","Opponent","Position","Line","PP Line","Expected TOI (min)","DK Salary",
-        "LxG Goals/60","LxG Assists/60","LxG SOG/60","LxG Blocks/60",
-        "LxD Goals/60","LxD Assists/60","LxD SOG/60","LxD Blocks/60",
-        "Season Goals/60","Season Assists/60","Season SOG/60","Season Blocks/60",
-        "Weighted Goals/60","Weighted Assists/60","Weighted SOG/60","Weighted Blocks/60",
-        "Opp_SOG_factor","Opp_xGA_factor","Opp_CA_factor","PP_Edge",
-        "Proj Goals (raw)","Proj Assists (raw)","Proj SOG (raw)","Proj Blocks (raw)",
-        "Projected DK Points","DFS Value Score","Proj Points (raw)","Line ID_5v5","Line Multiplier (xGF)",
-        "Adj Proj Goals","Adj Proj Assists","Adj Proj SOG"
+        "Name","Team","Position","Line","PP Line","TOI_5v5","TOI_PP","TOI_PK","DK Salary",
+        "G/60","A/60","SOG/60","BLK/60",
+        "Chemistry Mult","Opp_SOG_factor","Opp_xGA_factor","Opp_CA_factor","Goalie_Damp",
+        "Adj Proj Goals","Adj Proj Assists","Adj Proj SOG","Adj Proj Blocks",
+        "Projected DK Points","DFS Value Score","Line ID_5v5"
     ]
     for c in cols:
         if c not in sk.columns: sk[c] = ""
-    dfs_proj = sk[cols].copy()
+    dfs_proj = sk[cols].rename(columns={
+        "Name":"Player",
+        "TOI_5v5":"TOI_5v5 (min)","TOI_PP":"TOI_PP (min)","TOI_PK":"TOI_PK (min)"
+    }).copy()
 
-    # TOP STACKS: sum trio DK points and salary for 5v5 lines
+    # ----- TOP STACKS (5v5 lines only) -----
     if lines_df is not None and not lines_df.empty:
         lp = explode_line_players(lines_df)
         trio = lp[lp["Line Type"].str.match(r"^5v5 Line \d$", na=False)].copy()
         if trio.empty:
             top_stacks = pd.DataFrame()
         else:
-            # join to projections
             psmall = dfs_proj[["Player","Team","Projected DK Points","DK Salary","Line ID_5v5"]].copy()
             psmall["Player_norm"] = psmall["Player"].apply(norm_name)
             trio["Player_norm"]   = trio["Player"].apply(norm_name)
@@ -503,46 +540,88 @@ def build_projections(dk_df: pd.DataFrame, nst_players: pd.DataFrame, lines_df: 
     else:
         top_stacks = pd.DataFrame()
 
-    # GOALIES: baseline saves (upgrade later with SOG against model)
-    if not gk.empty:
-        gk2 = gk.rename(columns={"Name":"Goalie","Team":"Team","DK Salary":"DK Salary"})
-        gk2["Proj Saves"] = 29.0
-        goalies = gk2[["Goalie","Team","DK Salary","Proj Saves"]].copy()
-    else:
-        goalies = pd.DataFrame(columns=["Goalie","Team","DK Salary","Proj Saves"])
+    # Goalies built separately
+    goalies = pd.DataFrame()
 
     return dfs_proj, top_stacks, goalies
 
+def build_goalie_projections(dk_df: pd.DataFrame,
+                             line_chem: pd.DataFrame,
+                             goalie_sv_table: pd.DataFrame) -> pd.DataFrame:
+    """
+    Opponent-driven goalie projections with three-layer Weighted_SV.
+    If we can't map opponent, we use neutral FALLBACK values.
+    """
+    # Build goalie list from DK
+    if dk_df is None or dk_df.empty:
+        return pd.DataFrame(columns=["Goalie","Team","Opponent","DK Salary","Proj Saves","Proj GA","DK Points","Weighted_SV"])
+    dk = dk_df.copy()
+    ren = {}
+    for c in dk.columns:
+        lc = c.lower()
+        if lc == "name": ren[c] = "Name"
+        if lc == "teamabbrev": ren[c] = "Team"
+        if lc == "position": ren[c] = "Position"
+        if lc == "salary": ren[c] = "DK Salary"
+    dk = dk.rename(columns=ren)
+    gk = dk[dk["Position"].astype(str).str.contains("G", case=False, na=False)].copy()
+    if gk.empty:
+        return pd.DataFrame(columns=["Goalie","Team","Opponent","DK Salary","Proj Saves","Proj GA","DK Points","Weighted_SV"])
 
-# ========= MAIN PIPELINE =========
+    # Weighted SV% from NST three-layer table
+    if goalie_sv_table is None or goalie_sv_table.empty:
+        gk["Weighted_SV"] = LEAGUE_AVG_SV
+    else:
+        gk["Goalie_norm"] = gk["Name"].apply(norm_name)
+        gk = gk.merge(goalie_sv_table, on="Goalie_norm", how="left")
+        gk["Weighted_SV"] = gk["Weighted_SV"].fillna(LEAGUE_AVG_SV)
+
+    # Opponent mapping not wired yet → neutral opponent proxies
+    gk["Opponent"] = ""
+    gk["Opp_SF60"]  = FALLBACK_SF60
+    gk["Opp_xGF60"] = FALLBACK_xGF60
+
+    # Projections
+    gk["Proj Saves"] = gk["Opp_SF60"] * (GOALIE_TOI_MIN/60.0) * gk["Weighted_SV"]
+    gk["Proj GA"]    = gk["Opp_xGF60"]* (GOALIE_TOI_MIN/60.0) * (1.0 - gk["Weighted_SV"])
+    gk["DK Points"]  = gk["Proj Saves"]*0.7 - gk["Proj GA"]*3.5
+
+    return gk.rename(columns={"Name":"Goalie"})[[
+        "Goalie","Team","Opponent","DK Salary","Proj Saves","Proj GA","DK Points","Weighted_SV"
+    ]]
+
+# ================== MAIN ==================
 def main():
-    print("Fetching DK salaries...")
-    dk = fetch_dk_salaries()
-    dk.to_csv("data/dk_salaries.csv", index=False)
+    print("Reading DK salaries ...")
+    dk = fetch_dk_salaries_csv_if_present()
+    dk.to_csv("data/dk_salaries_echo.csv", index=False)
 
-    print("Fetching Odds...")
-    odds = fetch_odds()
-    odds.to_csv("data/sportsbook_odds.csv", index=False)
-
-    print("Fetching NST per-player stats...")
-    nst_players = fetch_nst_player_stats()
+    print("Fetching NST player three-layer stats ...")
+    nst_players = fetch_nst_player_stats_multi()
     nst_players.to_csv("data/nst_player_stats.csv", index=False)
 
-    print("Fetching lines (DFO → LWL fallback)...")
+    print("Fetching Lines (DFO → LWL fallback) ...")
     lines_df = fetch_lines_df()
     lines_df.to_csv("data/line_context.csv", index=False)
 
-    print("Building line chemistry...")
+    print("Building line chemistry ...")
     line_chem = build_line_chemistry(nst_players, lines_df)
     line_chem.to_csv("data/line_chemistry.csv", index=False)
 
-    print("Building projections (line-aware)...")
-    dfs_proj, top_stacks, goalies = build_projections(dk, nst_players, lines_df, line_chem)
+    print("Building skater projections (line-aware) ...")
+    dfs_proj, top_stacks, _ = build_projections(dk, nst_players, lines_df, line_chem)
     dfs_proj.to_csv("data/dfs_projections.csv", index=False)
     top_stacks.to_csv("data/top_stacks.csv", index=False)
+
+    print("Fetching NST goalie SV% (three-layer) ...")
+    goalie_sv = fetch_nst_goalie_sv_three_layer()
+    goalie_sv.to_csv("data/goalie_sv_table.csv", index=False)
+
+    print("Building goalie projections (opponent-driven) ...")
+    goalies = build_goalie_projections(dk, line_chem, goalie_sv)
     goalies.to_csv("data/goalies.csv", index=False)
 
-    print("All CSVs written to /data")
+    print("Done. CSVs written to /data")
 
 if __name__ == "__main__":
     main()
