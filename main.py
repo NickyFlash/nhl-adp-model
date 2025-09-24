@@ -7,7 +7,7 @@ Outputs: dfs_projections.csv, goalies.csv, top_stacks.csv (+ helper snapshots)
 import os, re, time, math, requests
 import pandas as pd
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, date
 
 # ---------------------------- CONFIG ----------------------------
 DATA_DIR = "data"
@@ -18,8 +18,21 @@ os.makedirs(RAW_DIR, exist_ok=True)
 HEADERS = {"User-Agent": "Mozilla/5.0 (ADP Free Model)"}
 TIMEOUT = 60
 
-CURR_SEASON = "20242025"
-LAST_SEASON = "20232024"
+# Auto-detect current and last NHL season
+today = date.today()
+year = today.year
+month = today.month
+
+# NHL seasons run Oct–Jun, so "season year" rolls over in July
+if month < 7:
+    start = year - 1
+    end   = year
+else:
+    start = year
+    end   = year + 1
+
+CURR_SEASON = f"{start}{end}"
+LAST_SEASON = f"{start-1}{start}"
 
 LEAGUE_AVG_SV = 0.905
 GOALIE_TOI_MIN = 60.0
