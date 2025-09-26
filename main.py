@@ -4,16 +4,17 @@ ADP NHL DFS / Betting Model - Master Script
 Outputs: dfs_projections.csv, goalies.csv, top_stacks.csv (+ helper snapshots)
 """
 
-import os, re, time, requests
+import os, requests
 import pandas as pd
 from bs4 import BeautifulSoup
-from datetime import datetime, date
+from datetime import date
 
 # --- ADP NHL baseline + lineups helpers ---
 from adp_nhl.utils.etl import ingest_baseline_if_needed
 from adp_nhl.utils.lineups_api import fetch_lineups
 from adp_nhl.utils.joins import join_lineups_with_baseline, load_processed
 from adp_nhl.utils.warnings import tag_missing_baseline, players_missing_baseline
+from adp_nhl.utils.common import norm_name, http_get_cached   # 👈 NEW
 
 # ---------------------------- CONFIG ----------------------------
 DATA_DIR = "data"
@@ -61,46 +62,8 @@ SETTINGS = {
     "sleep_lines": 2.0
 }
 
-# ---------------------------- HELPERS ----------------------------
-def norm_name(s: str) -> str:
-    s = re.sub(r"[\u2013\u2014\u2019]", "-", str(s))
-    s = re.sub(r"[^A-Za-z0-9\-\' ]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip().upper()
-    if "," in s:
-        parts = [p.strip() for p in s.split(",")]
-        if len(parts) == 2:
-            s = f"{parts[1]} {parts[0]}".strip()
-    return s
-
-def http_get_cached(url, tag, sleep=2):
-    today = datetime.today().strftime("%Y%m%d")
-    cache_file = os.path.join(RAW_DIR, f"{tag}_{today}.html")
-    if os.path.exists(cache_file):
-        with open(cache_file, "r", encoding="utf-8") as f:
-            return f.read()
-    tries = 0
-    while tries < 5:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-            if r.status_code == 429:
-                print("⚠️ Rate limited by NST/DFO. Sleeping 60s...")
-                time.sleep(60)
-                tries += 1
-                continue
-            r.raise_for_status()
-            html = r.text
-            with open(cache_file, "w", encoding="utf-8") as f:
-                f.write(html)
-            time.sleep(sleep)
-            return html
-        except Exception as e:
-            print(f"❌ Fetch error {tag}:", e)
-            time.sleep(10)
-            tries += 1
-    return None
-
 def guess_role(pos: str) -> str:
-    if not isinstance(pos,str): return "F"
+    if not isinstance(pos, str): return "F"
     p = pos.upper()
     if "G" in p: return "G"
     if "D" in p: return "D"
