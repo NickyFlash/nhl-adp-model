@@ -12,6 +12,11 @@ from datetime import datetime, date
 # --- ADP NHL baseline + lineups helpers ---
 from adp_nhl.utils.etl import ingest_baseline_if_needed
 from adp_nhl.utils.lineups_api import fetch_lineups
+from adp_nhl.utils.joins import join_lineups_with_baseline
+
+# Step 3: Join lineups with baseline stats
+merged_lineups = join_lineups_with_baseline(lineups)
+ print("✅ Merged lineups shape:", merged_lineups.shape)
 
 # ---------------------------- CONFIG ----------------------------
 DATA_DIR = "data"
