@@ -18,6 +18,12 @@ from adp_nhl.utils.joins import join_lineups_with_baseline
 merged_lineups = join_lineups_with_baseline(lineups)
  print("✅ Merged lineups shape:", merged_lineups.shape)
 
+# --- ADP NHL baseline + lineups helpers ---
+from adp_nhl.utils.etl import ingest_baseline_if_needed
+from adp_nhl.utils.lineups_api import fetch_lineups
+from adp_nhl.utils.joins import join_lineups_with_baseline, load_processed
+from adp_nhl.utils.warnings import tag_missing_baseline, players_missing_baseline
+
 # ---------------------------- CONFIG ----------------------------
 DATA_DIR = "data"
 RAW_DIR = os.path.join(DATA_DIR, "raw")
@@ -489,6 +495,29 @@ def build_stacks(dfs_proj):
 
 # ---------------------------- MAIN ----------------------------
 def main():
+ # Step 1: Ingest baseline (2024–25) if not already done
+    baseline_summary = ingest_baseline_if_needed()
+    print("✅ Baseline summary:", baseline_summary)
+
+    # Step 2: Fetch today's lineups (2025–26) via API (ETag-aware)
+    lineups = fetch_lineups()
+    print("✅ Lineups status:", lineups.get("status"), "Teams:", lineups.get("count"))
+
+    # Step 3: Join lineups with baseline skater stats
+    merged_lineups = join_lineups_with_baseline(lineups)
+    print("✅ Merged lineups shape:", getattr(merged_lineups, "shape", None))
+
+    # Step 4: Load baseline players parquet and tag rookies/missing-history players
+    _, _, _, _, players_df = load_processed()
+    merged_lineups = tag_missing_baseline(merged_lineups, players_df)
+    missing_df = players_missing_baseline(merged_lineups)
+    print("⚠️ Missing-baseline players:", len(missing_df))
+    # Optional: preview a few
+    try:
+        print(missing_df.head(15).to_string(index=False))
+    except Exception:
+        pass
+
     print("🚀 Starting ADP NHL DFS Model")
 
     # Step 1: Ingest baseline (2024–25 stats) if not already done
