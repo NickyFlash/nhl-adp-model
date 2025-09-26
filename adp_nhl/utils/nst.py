@@ -3,10 +3,10 @@
 NST Data Fetchers for 2025–26 season
 - Team-level stats
 - Goalie stats
-- Skater stats (blended: last 10 GP, last 30 days, season-to-date)
+- Skater stats (blended: last 10 GP, last 30 days, season-to-date, last season)
 """
 
-import os, re, time, requests
+import os, re
 import pandas as pd
 from datetime import datetime
 from adp_nhl.utils.common import norm_name, http_get_cached
@@ -42,20 +42,23 @@ CURR_SEASON = f"{start}{end}"
 LAST_SEASON = f"{start-1}{start}"
 
 # ---------------------------- HELPERS ----------------------------
-def blend_three_layer(recent, season, last, w_recent=0.50, w_season=0.35, w_last=0.15):
-    """Blend 3 stat sources: last 10 GP, season-to-date, last season"""
-    vals = [recent, season, last]
+def blend_three_layer(recent, mid, last, w_recent=0.50, w_mid=0.35, w_last=0.15):
+    """
+    Blend 3 stat sources into one weighted average.
+    Default: 50% recent, 35% season-to-date (or 30 days), 15% last season.
+    """
+    vals = [recent, mid, last]
     if all(pd.isna(v) for v in vals):
         return None
     num = 0.0; den = 0.0
     if pd.notna(recent): num += w_recent*recent; den += w_recent
-    if pd.notna(season): num += w_season*season; den += w_season
+    if pd.notna(mid):    num += w_mid*mid;       den += w_mid
     if pd.notna(last):   num += w_last*last;     den += w_last
     return num/den if den>0 else None
 
 # ---------------------------- TEAM STATS ----------------------------
 def get_team_stats():
-    """Pull 2025–26 team defensive/offensive rates from NST"""
+    """Pull 2025–26 team defensive/offensive rates from NST."""
     url = f"https://www.naturalstattrick.com/teamtable.php?fromseason={CURR_SEASON}&thruseason={CURR_SEASON}&stype=2&sit=all"
     html = http_get_cached(url, tag="nst_teamtable", sleep=SETTINGS["sleep_nst"])
     if html is None:
@@ -88,7 +91,7 @@ def get_team_stats():
 
 # ---------------------------- GOALIES ----------------------------
 def get_goalie_stats():
-    """Pull 2025–26 goalie save % from NST"""
+    """Pull 2025–26 goalie save % from NST."""
     url = f"https://www.naturalstattrick.com/playerteams.php?fromseason={CURR_SEASON}&thruseason={CURR_SEASON}&sit=all&playerstype=goalies"
     html = http_get_cached(url, tag="nst_goalies", sleep=SETTINGS["sleep_nst"])
     if html is None:
@@ -140,21 +143,13 @@ def _parse_nst_player_rows(html):
                     except: pass
             return None
 
-        g60   = pick_num("G")
-        a60   = pick_num("A")
-        sog60 = pick_num("(?:S|Shots)")
-        blk60 = pick_num("Blk")
-        cf60  = pick_num("CF")
-        ca60  = pick_num("CA")
-        xgf60 = pick_num("xGF")
-        xga60 = pick_num("xGA")
-        hdcf60= pick_num("HDCF")
-        hdca60= pick_num("HDCA")
         out.append({
             "PlayerRaw": pname, "NormName": norm_name(pname),
-            "G/60": g60, "A/60": a60, "SOG/60": sog60, "BLK/60": blk60,
-            "CF/60": cf60, "CA/60": ca60, "xGF/60": xgf60, "xGA/60": xga60,
-            "HDCF/60": hdcf60, "HDCA/60": hdca60
+            "G/60": pick_num("G"), "A/60": pick_num("A"),
+            "SOG/60": pick_num("(?:S|Shots)"), "BLK/60": pick_num("Blk"),
+            "CF/60": pick_num("CF"), "CA/60": pick_num("CA"),
+            "xGF/60": pick_num("xGF"), "xGA/60": pick_num("xGA"),
+            "HDCF/60": pick_num("HDCF"), "HDCA/60": pick_num("HDCA")
         })
     return pd.DataFrame(out)
 
@@ -175,19 +170,18 @@ def fetch_nst_player_stats_multi(teams):
       - Last 10 GP
       - Last 30 days
       - Full 2025–26 season
-      - Last season (for rookies or missing history)
-    Then blend.
+      - Last season (for rookies/missing history)
+    Then blend into weighted averages.
     """
     frames = []
     for abbr in teams:
-        # handle Utah/ARI alias edge-case
         try_codes = [abbr] if abbr != "UTA" else ["UTA","ARI"]
         got_any = False
         for code in try_codes:
-            season = _nst_players_for_team(code, CURR_SEASON, CURR_SEASON, tgp=None)
+            season = _nst_players_for_team(code, CURR_SEASON, CURR_SEASON)
             recent = _nst_players_for_team(code, CURR_SEASON, CURR_SEASON, tgp=10)
             last30 = _nst_players_for_team(code, CURR_SEASON, CURR_SEASON, tgp=30)
-            last   = _nst_players_for_team(code, LAST_SEASON, LAST_SEASON, tgp=None)
+            last   = _nst_players_for_team(code, LAST_SEASON, LAST_SEASON)
 
             if season.empty and code == "UTA":
                 continue
