@@ -9,6 +9,10 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime, date
 
+# --- ADP NHL baseline + lineups helpers ---
+from adp_nhl.utils.etl import ingest_baseline_if_needed
+from adp_nhl.utils.lineups_api import fetch_lineups
+
 # ---------------------------- CONFIG ----------------------------
 DATA_DIR = "data"
 RAW_DIR = os.path.join(DATA_DIR, "raw")
@@ -481,6 +485,14 @@ def build_stacks(dfs_proj):
 # ---------------------------- MAIN ----------------------------
 def main():
     print("🚀 Starting ADP NHL DFS Model")
+
+    # Step 1: Ingest baseline (2024–25 stats) if not already done
+    baseline_summary = ingest_baseline_if_needed()
+    print("✅ Baseline summary:", baseline_summary)
+
+    # Step 2: Fetch today’s lineups (2025–26, API-driven)
+    lineups = fetch_lineups()
+    print("✅ Lineups status:", lineups["status"], "Teams:", lineups.get("count"))
 
     dk_df = load_dk_salaries()
     if dk_df.empty: 
