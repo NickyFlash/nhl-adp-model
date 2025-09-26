@@ -24,11 +24,6 @@ os.makedirs(RAW_DIR, exist_ok=True)
 HEADERS = {"User-Agent": "Mozilla/5.0 (ADP Free Model)"}
 TIMEOUT = 60
 
-# Auto-detect current and last NHL season
-today = date.today()
-year = today.year
-month = today.month
-
 # NHL seasons run Oct–Jun, so "season year" rolls over in July
 if month < 7:
     start = year - 1
