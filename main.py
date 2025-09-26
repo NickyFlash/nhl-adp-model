@@ -4,7 +4,7 @@ ADP NHL DFS / Betting Model - Master Script
 Outputs: dfs_projections.csv, goalies.csv, top_stacks.csv (+ helper snapshots)
 """
 
-import os, re, time, math, requests
+import os, re, time, requests
 import pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime, date
@@ -24,8 +24,12 @@ os.makedirs(RAW_DIR, exist_ok=True)
 HEADERS = {"User-Agent": "Mozilla/5.0 (ADP Free Model)"}
 TIMEOUT = 60
 
-# NHL seasons run Oct–Jun, so "season year" rolls over in July
-if month < 7:
+# Auto-detect current and last NHL season
+today = date.today()
+year = today.year
+month = today.month
+
+if month < 7:  # NHL seasons run Oct–Jun, rollover in July
     start = year - 1
     end   = year
 else:
@@ -57,16 +61,6 @@ SETTINGS = {
     "sleep_lines": 2.0
 }
 
-DFO_SLUG = {
-    "ANA":"ducks","UTA":"utah-mammoth","BOS":"bruins","BUF":"sabres","CGY":"flames",
-    "CAR":"hurricanes","CHI":"blackhawks","COL":"avalanche","CBJ":"blue-jackets","DAL":"stars",
-    "DET":"red-wings","EDM":"oilers","FLA":"panthers","LAK":"kings","MIN":"wild",
-    "MTL":"canadiens","NSH":"predators","NJD":"devils","NYI":"islanders","NYR":"rangers",
-    "OTT":"senators","PHI":"flyers","PIT":"penguins","SJS":"sharks","SEA":"kraken",
-    "STL":"blues","TBL":"lightning","TOR":"maple-leafs","VAN":"canucks","VGK":"golden-knights",
-    "WSH":"capitals","WPG":"jets"
-}
-
 # ---------------------------- HELPERS ----------------------------
 def norm_name(s: str) -> str:
     s = re.sub(r"[\u2013\u2014\u2019]", "-", str(s))
@@ -79,7 +73,6 @@ def norm_name(s: str) -> str:
     return s
 
 def http_get_cached(url, tag, sleep=2):
-    """Fetch from cache if exists, else scrape and save. Retries if 429."""
     today = datetime.today().strftime("%Y%m%d")
     cache_file = os.path.join(RAW_DIR, f"{tag}_{today}.html")
     if os.path.exists(cache_file):
@@ -106,16 +99,6 @@ def http_get_cached(url, tag, sleep=2):
             tries += 1
     return None
 
-def blend_three_layer(recent, season, last, w_recent=0.50, w_season=0.35, w_last=0.15):
-    vals = [recent, season, last]
-    if all(pd.isna(v) for v in vals):
-        return None
-    num = 0.0; den = 0.0
-    if pd.notna(recent): num += w_recent*recent; den += w_recent
-    if pd.notna(season): num += w_season*season; den += w_season
-    if pd.notna(last):   num += w_last*last;     den += w_last
-    return num/den if den>0 else None
-
 def guess_role(pos: str) -> str:
     if not isinstance(pos,str): return "F"
     p = pos.upper()
@@ -132,7 +115,7 @@ def load_dk_salaries():
     try:
         df = pd.read_csv(path)
     except Exception:
-        df = pd.read_csv(path, sep=";")  # Some DK exports use semicolons
+        df = pd.read_csv(path, sep=";")
     ren = {}
     for c in df.columns:
         lc = c.lower()
@@ -188,7 +171,8 @@ def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
         pos  = row["Position"]
         opp  = opp_map.get(team)
 
-        # Player stats
+        # Player stats (from NST if available, else fallback)
+        g60=a60=s60=b60=None
         nst_row = nst_df[nst_df["NormName"]==nm].head(1)
         if not nst_row.empty:
             g60 = nst_row["B_G/60"].values[0]
@@ -272,19 +256,19 @@ def build_stacks(dfs_proj):
 
 # ---------------------------- MAIN ----------------------------
 def main():
-    # Step 1: Ingest baseline (2024–25) if not already done
+    # Step 1: Ingest baseline (2024–25 CSVs)
     baseline_summary = ingest_baseline_if_needed()
     print("✅ Baseline summary:", baseline_summary)
 
-    # Step 2: Fetch today's lineups (2025–26) via API (ETag-aware)
+    # Step 2: Fetch today’s projected lineups (2025–26 API)
     lineups = fetch_lineups()
     print("✅ Lineups status:", lineups.get("status"), "Teams:", lineups.get("count"))
 
-    # Step 3: Join lineups with baseline skater stats
+    # Step 3: Join lineups with 2024–25 baseline stats
     merged_lineups = join_lineups_with_baseline(lineups)
     print("✅ Merged lineups shape:", getattr(merged_lineups, "shape", None))
 
-    # Step 4: Load baseline players parquet and tag rookies/missing-history players
+    # Step 4: Tag rookies / missing-history players
     _, _, _, _, players_df = load_processed()
     merged_lineups = tag_missing_baseline(merged_lineups, players_df)
     missing_df = players_missing_baseline(merged_lineups)
@@ -296,7 +280,7 @@ def main():
 
     print("🚀 Starting ADP NHL DFS Model")
 
-    # Step 5: Load DK salaries
+    # Step 5: Load DraftKings salaries
     dk_df = load_dk_salaries()
     if dk_df.empty: 
         return
@@ -307,13 +291,17 @@ def main():
         return
     opp_map = build_opp_map(schedule_df)
 
-    # Step 7: Stats sources
+    # Step 7: Pull 2025–26 live stats (NST)
+    print("📊 Fetching 2025–26 NST stats...")
+    from adp_nhl.utils.nst import get_team_stats, fetch_nst_player_stats_multi, get_goalie_stats
     team_stats = get_team_stats()
     nst_df = fetch_nst_player_stats_multi(pd.unique(schedule_df[["Home","Away"]].values.ravel()))
-    lines_df = get_all_lines(schedule_df)
     goalie_df = get_goalie_stats()
 
-    # Step 8: Build projections
+    # Step 8: Use API lineups for line context
+    lines_df = pd.DataFrame(lineups.get("players", [])) if "players" in lineups else pd.DataFrame()
+
+    # Step 9: Build projections
     print("🛠️ Building skater projections...")
     dfs_proj = build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map)
 
