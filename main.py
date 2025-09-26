@@ -12,15 +12,6 @@ from datetime import datetime, date
 # --- ADP NHL baseline + lineups helpers ---
 from adp_nhl.utils.etl import ingest_baseline_if_needed
 from adp_nhl.utils.lineups_api import fetch_lineups
-from adp_nhl.utils.joins import join_lineups_with_baseline
-
-# Step 3: Join lineups with baseline stats
-merged_lineups = join_lineups_with_baseline(lineups)
- print("✅ Merged lineups shape:", merged_lineups.shape)
-
-# --- ADP NHL baseline + lineups helpers ---
-from adp_nhl.utils.etl import ingest_baseline_if_needed
-from adp_nhl.utils.lineups_api import fetch_lineups
 from adp_nhl.utils.joins import join_lineups_with_baseline, load_processed
 from adp_nhl.utils.warnings import tag_missing_baseline, players_missing_baseline
 
@@ -146,9 +137,7 @@ def load_dk_salaries():
     try:
         df = pd.read_csv(path)
     except Exception:
-        # Some DK exports can be semicolon-delimited
-        df = pd.read_csv(path, sep=";")
-    # Normalize columns
+        df = pd.read_csv(path, sep=";")  # Some DK exports use semicolons
     ren = {}
     for c in df.columns:
         lc = c.lower()
@@ -164,7 +153,6 @@ def load_dk_salaries():
             return pd.DataFrame()
     df["NormName"] = df["Name"].apply(norm_name)
     return df[required + ["NormName"]]
-
 
 # ---------------------------- NHL SCHEDULE ----------------------------
 def get_today_schedule():
@@ -196,208 +184,6 @@ def build_opp_map(schedule_df: pd.DataFrame):
         opp[a] = h
     return opp
 
-
-# ---------------------------- NST TEAM STATS (CACHED) ----------------------------
-def get_team_stats():
-    url = f"https://www.naturalstattrick.com/teamtable.php?fromseason={CURR_SEASON}&thruseason={CURR_SEASON}&stype=2&sit=all"
-    html = http_get_cached(url, tag="nst_teamtable", sleep=SETTINGS["sleep_nst"])
-    if html is None:
-        print("⚠️ NST team stats unavailable; formulas will use league fallbacks.")
-        return pd.DataFrame(columns=["Team","CA/60","xGA/60","SF/60","xGF/60"])
-    try:
-        # Parse manually to grab team codes + a few key rates reliably
-        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.DOTALL|re.IGNORECASE)
-        out = []
-        for row in rows:
-            m = re.search(r'teamreport\.php\?team=([A-Z]{2,3})', row)
-            if not m: 
-                continue
-            abbr = m.group(1)
-            def num(label):
-                m2 = re.search(rf"{label}[^0-9]*([0-9]+\.[0-9]+)", row, flags=re.IGNORECASE)
-                return float(m2.group(1)) if m2 else None
-            out.append({
-                "Team": abbr,
-                "CA/60":  num("CA/60")  or FALLBACK_CA60,
-                "xGA/60": num("xGA/60") or FALLBACK_xGA60,
-                "SF/60":  num("SF/60")  or FALLBACK_SF60,
-                "xGF/60": num("xGF/60") or FALLBACK_xGF60,
-            })
-        df = pd.DataFrame(out)
-        df.to_csv(os.path.join(DATA_DIR, "team_stats.csv"), index=False)
-        return df
-    except Exception as e:
-        print("❌ Parse NST team stats failed:", e)
-        return pd.DataFrame(columns=["Team","CA/60","xGA/60","SF/60","xGF/60"])
-
-
-# ---------------------------- NST PLAYER STATS (3-LAYER, CACHED) ----------------------------
-def _parse_nst_player_rows(html):
-    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.IGNORECASE|re.DOTALL)
-    out = []
-    for row in rows:
-        m_name = re.search(r'player(?:\.php\?id=|id=)\d+[^>]*>([^<]+)</a>', row, flags=re.IGNORECASE)
-        if not m_name:
-            m_name = re.search(r'<td[^>]*>\s*([A-Za-z \'\-\.]+)\s*</td>', row)
-        if not m_name:
-            continue
-        pname = m_name.group(1).strip()
-
-        def pick_num(label):
-            pats = [
-                rf'{label}\s*/\s*60[^0-9\-]*([0-9]*\.?[0-9]+)',
-                rf'{label}60[^0-9\-]*([0-9]*\.?[0-9]+)',
-                rf'{label}[^0-9\-]*([0-9]*\.?[0-9]+)'
-            ]
-            for pat in pats:
-                m = re.search(pat, row, flags=re.IGNORECASE)
-                if m:
-                    try: return float(m.group(1))
-                    except: pass
-            return None
-
-        g60   = pick_num("G")
-        a60   = pick_num("A")
-        sog60 = pick_num("(?:S|Shots)")
-        blk60 = pick_num("Blk")
-        cf60  = pick_num("CF")
-        ca60  = pick_num("CA")
-        xgf60 = pick_num("xGF")
-        xga60 = pick_num("xGA")
-        hdcf60= pick_num("HDCF")
-        hdca60= pick_num("HDCA")
-        out.append({
-            "PlayerRaw": pname, "NormName": norm_name(pname),
-            "G/60": g60, "A/60": a60, "SOG/60": sog60, "BLK/60": blk60,
-            "CF/60": cf60, "CA/60": ca60, "xGF/60": xgf60, "xGA/60": xga60,
-            "HDCF/60": hdcf60, "HDCA/60": hdca60
-        })
-    return pd.DataFrame(out)
-
-def _nst_players_for_team(team_code, from_season, thru_season, tgp=None):
-    qs = f"team={team_code}&sit=all&fromseason={from_season}&thruseason={thru_season}"
-    if tgp:
-        qs += f"&tgp={tgp}"
-    url = f"https://www.naturalstattrick.com/playerteams.php?{qs}"
-    tag = f"nst_players_{team_code}_{from_season}_{thru_season}_{tgp or 'all'}"
-    html = http_get_cached(url, tag=tag, sleep=SETTINGS['sleep_nst'])
-    if html is None:
-        return pd.DataFrame()
-    return _parse_nst_player_rows(html)
-
-def fetch_nst_player_stats_multi(teams):
-    """
-    For each team playing today, pull:
-      - Season blended per-60 (curr season + last season + recent 10 GP)
-    Uses caching per-team to stay well under NST limits.
-    """
-    frames = []
-    for abbr in teams:
-        try_codes = [abbr] if abbr != "UTA" else ["UTA","ARI"]  # Utah may alias to ARI
-        got_any = False
-        for code in try_codes:
-            season = _nst_players_for_team(code, CURR_SEASON, CURR_SEASON, tgp=None)
-            if season.empty and code == "UTA":
-                continue
-            recent = _nst_players_for_team(code, CURR_SEASON, CURR_SEASON, tgp=10)
-            last   = _nst_players_for_team(code, LAST_SEASON, LAST_SEASON, tgp=None)
-
-            # blend
-            merged = season.merge(recent[["NormName","G/60","A/60","SOG/60","BLK/60","CF/60","xGF/60","HDCF/60"]], 
-                                  on="NormName", how="left", suffixes=("","_r"))
-            merged = merged.merge(last[["NormName","G/60","A/60","SOG/60","BLK/60","CF/60","xGF/60","HDCF/60"]],
-                                  on="NormName", how="left", suffixes=("","_l"))
-            def b3(row, col):
-                return blend_three_layer(row.get(col+"_r"), row.get(col), row.get(col+"_l"))
-            for col in ["G/60","A/60","SOG/60","BLK/60","CF/60","xGF/60","HDCF/60"]:
-                merged[f"B_{col}"] = merged.apply(lambda r: b3(r, col), axis=1)
-
-            merged["Team"] = abbr
-            merged["PlayerKey"] = merged.apply(lambda r: f"{abbr}_{r['NormName']}", axis=1)
-            frames.append(merged[["Team","PlayerRaw","NormName","PlayerKey",
-                                  "B_G/60","B_A/60","B_SOG/60","B_BLK/60","B_CF/60","B_xGF/60","B_HDCF/60"]])
-            got_any = True
-            break
-        if not got_any:
-            print(f"⚠️ NST players missing for {abbr}; will use fallbacks for that team.")
-    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    out.to_csv(os.path.join(DATA_DIR, "nst_player_stats.csv"), index=False)
-    return out
-
-# ---------------------------- DAILY FACEOFF LINES (CACHED) ----------------------------
-def get_team_lines(team_abbrev):
-    slug = DFO_SLUG.get(team_abbrev)
-    if not slug:
-        return pd.DataFrame()
-    url = f"https://www.dailyfaceoff.com/teams/{slug}/line-combinations/"
-    html = http_get_cached(url, tag=f"dfo_{team_abbrev}", sleep=SETTINGS["sleep_lines"])
-    if html is None:
-        return pd.DataFrame()
-
-    soup = BeautifulSoup(html, "lxml")
-    lines = []
-    for sec in soup.find_all("section"):
-        title = sec.find("h2")
-        if not title:
-            continue
-        group = title.get_text(strip=True).upper()
-        table = sec.find("table")
-        if not table:
-            continue
-        for tr in table.find_all("tr")[1:]:
-            cols = [td.get_text(strip=True) for td in tr.find_all("td")]
-            if len(cols) < 1:
-                continue
-            player = norm_name(cols[0])
-            lines.append({
-                "Team": team_abbrev,
-                "NormName": player,
-                "Assignment": group
-            })
-    return pd.DataFrame(lines)
-
-def get_all_lines(schedule_df):
-    all_lines = []
-    for team in pd.unique(schedule_df[["Home","Away"]].values.ravel()):
-        print(f"📋 Fetching lines for {team}...")
-        df = get_team_lines(team)
-        if not df.empty:
-            all_lines.append(df)
-    if all_lines:
-        merged = pd.concat(all_lines, ignore_index=True)
-        merged.to_csv(os.path.join(DATA_DIR, "line_context.csv"), index=False)
-        return merged
-    return pd.DataFrame()
-
-
-# ---------------------------- GOALIE STATS (CACHED) ----------------------------
-def get_goalie_stats():
-    url = f"https://www.naturalstattrick.com/playerteams.php?fromseason={CURR_SEASON}&thruseason={CURR_SEASON}&sit=all&playerstype=goalies"
-    html = http_get_cached(url, tag="nst_goalies", sleep=SETTINGS["sleep_nst"])
-    if html is None:
-        return pd.DataFrame(columns=["PlayerRaw","NormName","SV%"])
-    try:
-        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.IGNORECASE|re.DOTALL)
-        out = []
-        for row in rows:
-            m_name = re.search(r'player(?:\.php\?id=|id=)\d+[^>]*>([^<]+)</a>', row, flags=re.IGNORECASE)
-            if not m_name:
-                continue
-            pname = m_name.group(1).strip()
-            sv_match = re.search(r'SV%[^0-9]*([0-9]*\.?[0-9]+)', row, flags=re.IGNORECASE)
-            sv_pct = float(sv_match.group(1))/100.0 if sv_match else LEAGUE_AVG_SV
-            out.append({
-                "PlayerRaw": pname,
-                "NormName": norm_name(pname),
-                "SV%": sv_pct
-            })
-        df = pd.DataFrame(out)
-        df.to_csv(os.path.join(DATA_DIR, "goalie_sv_table.csv"), index=False)
-        return df
-    except Exception as e:
-        print("❌ Parse NST goalie stats failed:", e)
-        return pd.DataFrame(columns=["PlayerRaw","NormName","SV%"])
-
 # ---------------------------- BUILD PROJECTIONS ----------------------------
 def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
     players = []
@@ -415,7 +201,6 @@ def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
             s60 = nst_row["B_SOG/60"].values[0]
             b60 = nst_row["B_BLK/60"].values[0]
         else:
-            # fallback by role
             role = guess_role(pos)
             fb = SETTINGS["D_fallback"] if role=="D" else SETTINGS["F_fallback"]
             g60,a60,s60,b60 = fb["G60"],fb["A60"],fb["SOG60"],fb["BLK60"]
@@ -453,7 +238,6 @@ def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
     df.to_csv(os.path.join(DATA_DIR,"dfs_projections.csv"), index=False)
     return df
 
-
 def build_goalies(goalie_df, team_stats, opp_map):
     goalies = []
     for _, row in goalie_df.iterrows():
@@ -474,7 +258,6 @@ def build_goalies(goalie_df, team_stats, opp_map):
     df.to_csv(os.path.join(DATA_DIR,"goalies.csv"), index=False)
     return df
 
-
 def build_stacks(dfs_proj):
     stacks = []
     for team, grp in dfs_proj.groupby("Team"):
@@ -492,10 +275,9 @@ def build_stacks(dfs_proj):
     df.to_csv(os.path.join(DATA_DIR,"top_stacks.csv"), index=False)
     return df
 
-
 # ---------------------------- MAIN ----------------------------
 def main():
- # Step 1: Ingest baseline (2024–25) if not already done
+    # Step 1: Ingest baseline (2024–25) if not already done
     baseline_summary = ingest_baseline_if_needed()
     print("✅ Baseline summary:", baseline_summary)
 
@@ -512,7 +294,6 @@ def main():
     merged_lineups = tag_missing_baseline(merged_lineups, players_df)
     missing_df = players_missing_baseline(merged_lineups)
     print("⚠️ Missing-baseline players:", len(missing_df))
-    # Optional: preview a few
     try:
         print(missing_df.head(15).to_string(index=False))
     except Exception:
@@ -520,28 +301,24 @@ def main():
 
     print("🚀 Starting ADP NHL DFS Model")
 
-    # Step 1: Ingest baseline (2024–25 stats) if not already done
-    baseline_summary = ingest_baseline_if_needed()
-    print("✅ Baseline summary:", baseline_summary)
-
-    # Step 2: Fetch today’s lineups (2025–26, API-driven)
-    lineups = fetch_lineups()
-    print("✅ Lineups status:", lineups["status"], "Teams:", lineups.get("count"))
-
+    # Step 5: Load DK salaries
     dk_df = load_dk_salaries()
     if dk_df.empty: 
         return
 
+    # Step 6: Get today’s schedule & opponents
     schedule_df = get_today_schedule()
     if schedule_df.empty:
         return
     opp_map = build_opp_map(schedule_df)
 
+    # Step 7: Stats sources
     team_stats = get_team_stats()
     nst_df = fetch_nst_player_stats_multi(pd.unique(schedule_df[["Home","Away"]].values.ravel()))
     lines_df = get_all_lines(schedule_df)
     goalie_df = get_goalie_stats()
 
+    # Step 8: Build projections
     print("🛠️ Building skater projections...")
     dfs_proj = build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map)
 
