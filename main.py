@@ -286,5 +286,16 @@ def main():
 
     print("✅ All outputs saved to /data")
 
+ # --- EXPORT TO EXCEL (one workbook with all tabs) ---
+    print("📊 Exporting results to Excel...")
+    output_path = os.path.join(DATA_DIR, f"projections_{datetime.today().strftime('%Y%m%d')}.xlsx")
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        dfs_proj.to_excel(writer, sheet_name="Skaters", index=False)
+        goalie_proj.to_excel(writer, sheet_name="Goalies", index=False)
+        stack_proj.to_excel(writer, sheet_name="Stacks", index=False)
+        team_stats.to_excel(writer, sheet_name="Teams", index=False)
+        nst_df.to_excel(writer, sheet_name="NST_Raw", index=False)
+    print(f"✅ Excel workbook ready: {output_path}")
+
 if __name__=="__main__":
     main()
