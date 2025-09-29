@@ -297,5 +297,18 @@ def main():
         nst_df.to_excel(writer, sheet_name="NST_Raw", index=False)
     print(f"✅ Excel workbook ready: {output_path}")
 
+ # --- EXPORT TO GOOGLE SHEETS ---
+    from adp_nhl.utils.export_sheets import upload_to_sheets
+
+    print("📤 Uploading projections to Google Sheets...")
+    tabs = {
+        "Skaters": dfs_proj,
+        "Goalies": goalie_proj,
+        "Stacks": stack_proj,
+        "Teams": team_stats,
+        "NST_Raw": nst_df
+    }
+    upload_to_sheets("ADP NHL Projections", tabs)  # <-- replace with your exact sheet name
+
 if __name__=="__main__":
     main()
