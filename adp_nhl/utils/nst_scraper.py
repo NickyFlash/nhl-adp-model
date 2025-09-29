@@ -38,31 +38,39 @@ def http_get_cached(url, tag, sleep=3):
         return None
 
 # --- Team Stats ---
-def get_team_stats(season_code: str):
-    url = f"https://www.naturalstattrick.com/teamtable.php?fromseason={season_code}&thruseason={season_code}&stype=2&sit=all"
-    html = http_get_cached(url, tag=f"nst_team_{season_code}")
+def get_team_stats(season):
+    url = f"https://www.naturalstattrick.com/teamtable.php?fromseason={season}&thruseason={season}&stype=2&sit=all"
+    html = http_get_cached(url, tag=f"nst_teamtable_{season}", sleep=SETTINGS["sleep_nst"])
     if html is None:
-        return pd.DataFrame(columns=["Team","CA/60","xGA/60","SF/60","xGF/60"])
-    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.DOTALL|re.IGNORECASE)
-    out = []
-    for row in rows:
-        m = re.search(r'teamreport\.php\?team=([A-Z]{2,3})', row)
-        if not m:
-            continue
-        abbr = m.group(1)
-        def num(label):
-            m2 = re.search(rf"{label}[^0-9]*([0-9]+\.[0-9]+)", row, flags=re.IGNORECASE)
-            return float(m2.group(1)) if m2 else None
-        out.append({
-            "Team": abbr,
-            "CA/60":  num("CA/60")  or FALLBACK_CA60,
-            "xGA/60": num("xGA/60") or FALLBACK_xGA60,
-            "SF/60":  num("SF/60")  or FALLBACK_SF60,
-            "xGF/60": num("xGF/60") or FALLBACK_xGF60,
-        })
-    df = pd.DataFrame(out)
-    df.to_parquet(os.path.join("data","processed",f"nst_team_{season_code}.parquet"), index=False)
-    return df
+        print("⚠️ NST team stats unavailable; using league fallbacks.")
+        return pd.DataFrame(columns=["Team","CF/60","CA/60","SF/60","xGF/60","xGA/60"])
+    try:
+        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.DOTALL|re.IGNORECASE)
+        out = []
+        for row in rows:
+            m = re.search(r'teamreport\.php\?team=([A-Z]{2,3})', row)
+            if not m: 
+                continue
+            abbr = m.group(1)
+
+            def num(label, fallback=None):
+                m2 = re.search(rf"{label}[^0-9]*([0-9]+\.[0-9]+)", row, flags=re.IGNORECASE)
+                return float(m2.group(1)) if m2 else fallback
+
+            out.append({
+                "Team": abbr,
+                "CF/60":  num("CF/60"),
+                "CA/60":  num("CA/60")  or FALLBACK_CA60,
+                "SF/60":  num("SF/60")  or FALLBACK_SF60,
+                "xGF/60": num("xGF/60") or FALLBACK_xGF60,
+                "xGA/60": num("xGA/60") or FALLBACK_xGA60,
+            })
+        df = pd.DataFrame(out)
+        df.to_csv(os.path.join(DATA_DIR, "team_stats.csv"), index=False)
+        return df
+    except Exception as e:
+        print("❌ Parse NST team stats failed:", e)
+        return pd.DataFrame(columns=["Team","CF/60","CA/60","SF/60","xGF/60","xGA/60"])
 
 # --- Player Stats (Skaters) ---
 def _parse_nst_player_rows(html):
