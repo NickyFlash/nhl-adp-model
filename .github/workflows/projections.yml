@@ -2,29 +2,41 @@ name: Daily NHL Projections
 
 on:
   schedule:
-    - cron: "0 13 * * *"   # Runs every day at 9AM EST (13:00 UTC)
-  workflow_dispatch:        # Allows you to trigger manually
+    - cron: "0 12 * * *"   # every day at 12:00 UTC (7am EST / 8am EDT)
+  workflow_dispatch:       # allow manual runs
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repo
-      uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
 
-    - name: Install dependencies
-      run: |
-        pip install --upgrade pip
-        pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    - name: Run projections
-      env:
-        GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
-      run: |
-        python main.py
+      - name: Run projections
+        env:
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+        run: |
+          python main.py
+
+      - name: Upload data outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: projections-data
+          path: data/*.csv
+
+      - name: Upload Excel workbook
+        uses: actions/upload-artifact@v4
+        with:
+          name: projections-excel
+          path: data/*.xlsx
