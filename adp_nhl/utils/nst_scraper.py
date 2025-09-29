@@ -1,0 +1,138 @@
+import os, re, time, requests
+import pandas as pd
+from datetime import datetime
+from adp_nhl.utils.joins import load_processed
+
+# Config
+DATA_DIR = "data"
+RAW_DIR = os.path.join(DATA_DIR, "raw")
+os.makedirs(RAW_DIR, exist_ok=True)
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (ADP Free Model)"}
+TIMEOUT = 60
+LEAGUE_AVG_SV = 0.905
+
+# Fall back values if NST fails
+FALLBACK_CA60  = 58.0
+FALLBACK_xGA60 = 2.65
+FALLBACK_SF60  = 31.0
+FALLBACK_xGF60 = 2.95
+
+# --- Simple cache fetch ---
+def http_get_cached(url, tag, sleep=3):
+    today = datetime.today().strftime("%Y%m%d")
+    cache_file = os.path.join(RAW_DIR, f"{tag}_{today}.html")
+    if os.path.exists(cache_file):
+        with open(cache_file, "r", encoding="utf-8") as f:
+            return f.read()
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        r.raise_for_status()
+        html = r.text
+        with open(cache_file, "w", encoding="utf-8") as f:
+            f.write(html)
+        time.sleep(sleep)
+        return html
+    except Exception as e:
+        print(f"❌ Fetch error {tag}:", e)
+        return None
+
+# --- Team Stats ---
+def get_team_stats(season_code: str):
+    url = f"https://www.naturalstattrick.com/teamtable.php?fromseason={season_code}&thruseason={season_code}&stype=2&sit=all"
+    html = http_get_cached(url, tag=f"nst_team_{season_code}")
+    if html is None:
+        return pd.DataFrame(columns=["Team","CA/60","xGA/60","SF/60","xGF/60"])
+    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.DOTALL|re.IGNORECASE)
+    out = []
+    for row in rows:
+        m = re.search(r'teamreport\.php\?team=([A-Z]{2,3})', row)
+        if not m:
+            continue
+        abbr = m.group(1)
+        def num(label):
+            m2 = re.search(rf"{label}[^0-9]*([0-9]+\.[0-9]+)", row, flags=re.IGNORECASE)
+            return float(m2.group(1)) if m2 else None
+        out.append({
+            "Team": abbr,
+            "CA/60":  num("CA/60")  or FALLBACK_CA60,
+            "xGA/60": num("xGA/60") or FALLBACK_xGA60,
+            "SF/60":  num("SF/60")  or FALLBACK_SF60,
+            "xGF/60": num("xGF/60") or FALLBACK_xGF60,
+        })
+    df = pd.DataFrame(out)
+    df.to_parquet(os.path.join("data","processed",f"nst_team_{season_code}.parquet"), index=False)
+    return df
+
+# --- Player Stats (Skaters) ---
+def _parse_nst_player_rows(html):
+    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.IGNORECASE|re.DOTALL)
+    out = []
+    for row in rows:
+        m_name = re.search(r'player(?:\.php\?id=|id=)\d+[^>]*>([^<]+)</a>', row, flags=re.IGNORECASE)
+        if not m_name:
+            continue
+        pname = m_name.group(1).strip()
+
+        def pick_num(label):
+            pats = [
+                rf'{label}\s*/\s*60[^0-9\-]*([0-9]*\.?[0-9]+)',
+                rf'{label}60[^0-9\-]*([0-9]*\.?[0-9]+)',
+                rf'{label}[^0-9\-]*([0-9]*\.?[0-9]+)'
+            ]
+            for pat in pats:
+                m = re.search(pat, row, flags=re.IGNORECASE)
+                if m:
+                    try: return float(m.group(1))
+                    except: pass
+            return None
+
+        g60   = pick_num("G")
+        a60   = pick_num("A")
+        sog60 = pick_num("S")
+        blk60 = pick_num("Blk")
+        cf60  = pick_num("CF")
+        xgf60 = pick_num("xGF")
+        hdcf60= pick_num("HDCF")
+        out.append({
+            "PlayerRaw": pname,
+            "G/60": g60, "A/60": a60, "SOG/60": sog60, "BLK/60": blk60,
+            "CF/60": cf60, "xGF/60": xgf60, "HDCF/60": hdcf60
+        })
+    return pd.DataFrame(out)
+
+def get_team_players(team_code, season_code, tgp=None):
+    qs = f"team={team_code}&sit=all&fromseason={season_code}&thruseason={season_code}"
+    if tgp:
+        qs += f"&tgp={tgp}"
+    url = f"https://www.naturalstattrick.com/playerteams.php?{qs}"
+    tag = f"nst_players_{team_code}_{season_code}_{tgp or 'all'}"
+    html = http_get_cached(url, tag=tag)
+    if html is None:
+        return pd.DataFrame()
+    return _parse_nst_player_rows(html)
+
+def get_goalies(season_code: str):
+    url = f"https://www.naturalstattrick.com/playerteams.php?fromseason={season_code}&thruseason={season_code}&sit=all&playerstype=goalies"
+    html = http_get_cached(url, tag=f"nst_goalies_{season_code}")
+    if html is None:
+        return pd.DataFrame(columns=["PlayerRaw","SV%"])
+    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.IGNORECASE|re.DOTALL)
+    out = []
+    for row in rows:
+        m_name = re.search(r'player(?:\.php\?id=|id=)\d+[^>]*>([^<]+)</a>', row, flags=re.IGNORECASE)
+        if not m_name:
+            continue
+        pname = m_name.group(1).strip()
+        sv_match = re.search(r'SV%[^0-9]*([0-9]*\.?[0-9]+)', row, flags=re.IGNORECASE)
+        sv_pct = float(sv_match.group(1))/100.0 if sv_match else LEAGUE_AVG_SV
+        out.append({"PlayerRaw": pname, "SV%": sv_pct})
+    df = pd.DataFrame(out)
+    df.to_parquet(os.path.join("data","processed",f"nst_goalies_{season_code}.parquet"), index=False)
+    return df
+🟢 Step 3. Import into main.py
+At the top of main.py, add:
+
+python
+Copy code
+from adp_nhl.utils import nst_scraper
