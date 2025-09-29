@@ -120,24 +120,45 @@ def get_team_players(team_code, season_code, tgp=None):
         return pd.DataFrame()
     return _parse_nst_player_rows(html)
 
-def get_goalies(season_code: str):
-    url = f"https://www.naturalstattrick.com/playerteams.php?fromseason={season_code}&thruseason={season_code}&sit=all&playerstype=goalies"
-    html = http_get_cached(url, tag=f"nst_goalies_{season_code}")
-    if html is None:
-        return pd.DataFrame(columns=["PlayerRaw","SV%"])
-    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.IGNORECASE|re.DOTALL)
-    out = []
-    for row in rows:
-        m_name = re.search(r'player(?:\.php\?id=|id=)\d+[^>]*>([^<]+)</a>', row, flags=re.IGNORECASE)
-        if not m_name:
-            continue
-        pname = m_name.group(1).strip()
-        sv_match = re.search(r'SV%[^0-9]*([0-9]*\.?[0-9]+)', row, flags=re.IGNORECASE)
-        sv_pct = float(sv_match.group(1))/100.0 if sv_match else LEAGUE_AVG_SV
-        out.append({"PlayerRaw": pname, "SV%": sv_pct})
-    df = pd.DataFrame(out)
-    df.to_parquet(os.path.join("data","processed",f"nst_goalies_{season_code}.parquet"), index=False)
-    return df
+def get_goalies(season, last_season=None):
+    """
+    Pull goalie stats for season, last 10 GP, and last season.
+    Do not blend here — just return splits so projections can weight them.
+    """
+    if not last_season:
+        last_season = str(int(season[:4]) - 1) + str(int(season[:4]))
+
+    def fetch_goalie_stats(season, tgp=None):
+        qs = f"fromseason={season}&thruseason={season}&sit=all&playerstype=goalies"
+        if tgp:
+            qs += f"&tgp={tgp}"
+        url = f"https://www.naturalstattrick.com/playerteams.php?{qs}"
+        tag = f"nst_goalies_{season}_{tgp or 'all'}"
+        html = http_get_cached(url, tag=tag, sleep=SETTINGS["sleep_nst"])
+        if html is None:
+            return pd.DataFrame()
+
+        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.IGNORECASE|re.DOTALL)
+        out = []
+        for row in rows:
+            m_name = re.search(r'player(?:\.php\?id=|id=)\d+[^>]*>([^<]+)</a>', row, flags=re.IGNORECASE)
+            if not m_name:
+                continue
+            pname = m_name.group(1).strip()
+            sv_match = re.search(r'SV%[^0-9]*([0-9]*\.?[0-9]+)', row, flags=re.IGNORECASE)
+            sv_pct = float(sv_match.group(1))/100.0 if sv_match else None
+            out.append({"PlayerRaw": pname, "NormName": norm_name(pname), "SV%": sv_pct})
+        return pd.DataFrame(out)
+
+    season_df = fetch_goalie_stats(season).rename(columns={"SV%":"SV_season"})
+    recent_df = fetch_goalie_stats(season, tgp=10).rename(columns={"SV%":"SV_recent"})
+    last_df   = fetch_goalie_stats(last_season).rename(columns={"SV%":"SV_last"})
+
+    merged = season_df.merge(recent_df[["NormName","SV_recent"]], on="NormName", how="left")
+    merged = merged.merge(last_df[["NormName","SV_last"]], on="NormName", how="left")
+
+    return merged
+    
 🟢 Step 3. Import into main.py
 At the top of main.py, add:
 
