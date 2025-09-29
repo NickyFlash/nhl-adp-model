@@ -3,11 +3,8 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 def upload_to_sheets(sheet_name, tabs_dict):
     """
-    Upload pandas DataFrames to Google Sheets.
-    Uses the GCP_CREDENTIALS secret stored in GitHub Actions.
-    
-    :param sheet_name: name of the Google Sheet (must exist + shared with the service account email)
-    :param tabs_dict: dictionary { "TabName": dataframe, ... }
+    Upload pandas DataFrames to Google Sheets (multiple tabs).
+    Uses the GCP_CREDENTIALS GitHub Actions secret (JSON string).
     """
     creds_json = os.environ.get("GCP_CREDENTIALS")
     if not creds_json:
@@ -17,14 +14,12 @@ def upload_to_sheets(sheet_name, tabs_dict):
 
     scope = ["https://spreadsheets.google.com/feeds",
              "https://www.googleapis.com/auth/drive"]
-
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(creds)
 
-    # Open the Google Sheet
+    # open the target sheet (must already exist & be shared with the service account email)
     sh = client.open(sheet_name)
 
-    # Write each dataframe to its tab
     for tab_name, df in tabs_dict.items():
         try:
             ws = sh.worksheet(tab_name)
@@ -36,5 +31,3 @@ def upload_to_sheets(sheet_name, tabs_dict):
             ws.update([["(no rows)"]])
         else:
             ws.update([df.columns.tolist()] + df.values.tolist())
-
-    print(f"✅ Google Sheet '{sheet_name}' updated successfully!")
