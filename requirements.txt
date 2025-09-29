@@ -3,3 +3,7 @@ beautifulsoup4
 lxml
 pandas
 python-dateutil
+numpy
+gspread
+oauth2client
+openpyxl
