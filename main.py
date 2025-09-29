@@ -128,15 +128,20 @@ def build_opp_map(schedule_df: pd.DataFrame):
 # ---------------------------- BUILD PROJECTIONS ----------------------------
 def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
     players = []
-    for _, row in dk_df.iterrows():
-        nm   = row["NormName"]
-        team = row["TeamAbbrev"]
-        pos  = row["Position"]
+
+    # If no salaries available, fallback to using NST players instead
+    source_df = dk_df if not dk_df.empty else nst_df.copy()
+    if dk_df.empty:
+        print("⚠️ DK salaries not found, building projections without salaries...")
+
+    for _, row in source_df.iterrows():
+        nm   = row.get("NormName")
+        team = row.get("TeamAbbrev") if "TeamAbbrev" in row else row.get("Team")
+        pos  = row.get("Position", "F")
         opp  = opp_map.get(team)
 
-        # Player stats (from NST if available, else fallback)
-        g60=a60=s60=b60=None
-        nst_row = nst_df[nst_df["NormName"]==nm].head(1)
+        # Player stats
+        nst_row = nst_df[nst_df["NormName"] == nm].head(1)
         if not nst_row.empty:
             g60 = nst_row["B_G/60"].values[0]
             a60 = nst_row["B_A/60"].values[0]
@@ -144,18 +149,18 @@ def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
             b60 = nst_row["B_BLK/60"].values[0]
         else:
             role = guess_role(pos)
-            fb = SETTINGS["D_fallback"] if role=="D" else SETTINGS["F_fallback"]
+            fb = SETTINGS["D_fallback"] if role == "D" else SETTINGS["F_fallback"]
             g60,a60,s60,b60 = fb["G60"],fb["A60"],fb["SOG60"],fb["BLK60"]
 
         # Opponent adjustment
-        opp_stats = team_stats[team_stats.Team==opp]
+        opp_stats = team_stats[team_stats.Team == opp]
         sog_factor = (opp_stats["SF/60"].values[0] / FALLBACK_SF60) if not opp_stats.empty else 1.0
         xga_factor = (opp_stats["xGA/60"].values[0] / FALLBACK_xGA60) if not opp_stats.empty else 1.0
 
         # Line context
-        line_row = lines_df[(lines_df.NormName==nm)&(lines_df.Team==team)]
+        line_row = lines_df[(lines_df.NormName == nm) & (lines_df.Team == team)]
         line_info = line_row["Assignment"].iloc[0] if not line_row.empty else "NA"
-        line_mult = SETTINGS["LineMult_byType"].get(line_info,1.0)
+        line_mult = SETTINGS["LineMult_byType"].get(line_info, 1.0)
 
         # Projections
         proj_goals  = g60 * xga_factor * line_mult
@@ -167,56 +172,90 @@ def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
                      proj_assists*SETTINGS["DK_points"]["Assist"] +
                      proj_sog*SETTINGS["DK_points"]["SOG"] +
                      proj_blocks*SETTINGS["DK_points"]["Block"])
-        value = dk_points / row["Salary"]*1000 if row["Salary"]>0 else 0
 
-        players.append({
-            "Player": row["Name"], "Team": team, "Opponent": opp, "Position": pos,
-            "Line": line_info, "Salary": row["Salary"],
+        player_dict = {
+            "Player": row.get("Name", nm), "Team": team, "Opponent": opp, "Position": pos,
+            "Line": line_info,
             "Proj Goals": proj_goals, "Proj Assists": proj_assists,
             "Proj SOG": proj_sog, "Proj Blocks": proj_blocks,
-            "DK Points": dk_points, "DFS Value Score": value
-        })
+            "DK Points": dk_points
+        }
+
+        # Only add Salary + Value if salaries exist
+        if not dk_df.empty:
+            player_dict["Salary"] = row["Salary"]
+            player_dict["DFS Value Score"] = dk_points / row["Salary"] * 1000 if row["Salary"] > 0 else 0
+
+        players.append(player_dict)
+
     df = pd.DataFrame(players)
-    df.to_csv(os.path.join(DATA_DIR,"dfs_projections.csv"), index=False)
+    df.to_csv(os.path.join(DATA_DIR, "dfs_projections.csv"), index=False)
     return df
 
 def build_goalies(goalie_df, team_stats, opp_map):
     goalies = []
+    if goalie_df.empty:
+        print("⚠️ No goalie stats found, skipping goalie projections...")
+        return pd.DataFrame()
+
     for _, row in goalie_df.iterrows():
-        team = row.get("Team","")
-        if not team: 
+        team = row.get("Team", "")
+        if not team:
             continue
         opp = opp_map.get(team)
         sv_pct = row.get("SV%", LEAGUE_AVG_SV)
-        opp_stats = team_stats[team_stats.Team==opp]
+        opp_stats = team_stats[team_stats.Team == opp]
         opp_sf = opp_stats["SF/60"].values[0] if not opp_stats.empty else FALLBACK_SF60
-        proj_saves = opp_sf * sv_pct
-        proj_ga    = opp_sf * (1-sv_pct)
-        goalies.append({
-            "Goalie": row["PlayerRaw"], "Team": team, "Opponent": opp,
-            "Proj Saves": proj_saves, "Proj GA": proj_ga
-        })
-    df = pd.DataFrame(goalies)
-    df.to_csv(os.path.join(DATA_DIR,"goalies.csv"), index=False)
-    return df
 
+        proj_saves = opp_sf * sv_pct
+        proj_ga    = opp_sf * (1 - sv_pct)
+
+        goalie_dict = {
+            "Goalie": row.get("PlayerRaw", row.get("NormName")),
+            "Team": team,
+            "Opponent": opp,
+            "Proj Saves": proj_saves,
+            "Proj GA": proj_ga
+        }
+
+        goalies.append(goalie_dict)
+
+    df = pd.DataFrame(goalies)
+    df.to_csv(os.path.join(DATA_DIR, "goalies.csv"), index=False)
+    return df
+    
 def build_stacks(dfs_proj):
     stacks = []
+    if dfs_proj.empty:
+        print("⚠️ No skater projections available, skipping stacks...")
+        return pd.DataFrame()
+
     for team, grp in dfs_proj.groupby("Team"):
         for line, players in grp.groupby("Line"):
-            if line=="NA": continue
-            cost = players["Salary"].sum()
-            pts  = players["DK Points"].sum()
-            val  = pts/cost*1000 if cost>0 else 0
-            stacks.append({
-                "Team": team, "Line": line,
-                "Players": ", ".join(players.Player),
-                "Cost": cost, "ProjPts": pts, "StackValue": val
-            })
-    df = pd.DataFrame(stacks)
-    df.to_csv(os.path.join(DATA_DIR,"top_stacks.csv"), index=False)
-    return df
+            if line == "NA": 
+                continue
+            pts = players["DK Points"].sum()
 
+            stack_dict = {
+                "Team": team,
+                "Line": line,
+                "Players": ", ".join(players.Player),
+                "ProjPts": pts
+            }
+
+            # Add salary-based metrics if available
+            if "Salary" in players.columns:
+                cost = players["Salary"].sum()
+                val  = pts / cost * 1000 if cost > 0 else 0
+                stack_dict["Cost"] = cost
+                stack_dict["StackValue"] = val
+
+            stacks.append(stack_dict)
+
+    df = pd.DataFrame(stacks)
+    df.to_csv(os.path.join(DATA_DIR, "top_stacks.csv"), index=False)
+    return df
+    
 # ---------------------------- MAIN ----------------------------
 def main():
     # Step 1: Ingest baseline (2024–25 stats) if not already done
