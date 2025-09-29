@@ -2,7 +2,8 @@ name: Daily NHL Projections
 
 on:
   schedule:
-    - cron: "0 12 * * *"   # every day at 12:00 UTC (7am EST / 8am EDT)
+    - cron: "0 12 * * *"   # 7am EST / 8am EDT
+    - cron: "0 20 * * *"   # 3pm EST / 4pm EDT
   workflow_dispatch:       # allow manual runs
 
 jobs:
