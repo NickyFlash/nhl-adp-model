@@ -188,34 +188,42 @@ def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
     return df
 
 
-def build_goalies(goalie_sv_df, team_stats, opp_map, merged_lineups):
-    goalies_today = (
-        merged_lineups[merged_lineups["Position"].str.contains("G", na=False)]
-        [["Team","NormName"]]
-        .drop_duplicates()
-    )
+def build_goalies(goalie_sv_df, team_stats, opp_map, dk_df):
+    goalies_today = goalie_sv_df.copy()
     if goalies_today.empty:
-        print("⚠️ No goalies found in today's lineups.")
+        print("⚠️ No goalie stats found, skipping goalie projections...")
         return pd.DataFrame()
 
-    df = goalies_today.merge(goalie_sv_df[["NormName","SV%"]], on="NormName", how="left")
-    df["SV%"] = df["SV%"].fillna(LEAGUE_AVG_SV)
-    df["Opponent"] = df["Team"].map(opp_map)
+    # Map opponents
+    goalies_today["Opponent"] = goalies_today["Team"].map(opp_map)
 
-    df = df.merge(
+    # Merge opponent SF/60 for save projections
+    goalies_today = goalies_today.merge(
         team_stats[["Team","SF/60"]].rename(columns={"Team":"Opponent","SF/60":"Opp_SF60"}),
         on="Opponent", how="left"
     )
-    df["Opp_SF60"] = df["Opp_SF60"].fillna(FALLBACK_SF60)
-    df["Proj Saves"] = df["Opp_SF60"] * df["SV%"]
-    df["Proj GA"]    = df["Opp_SF60"] * (1.0 - df["SV%"])
+    goalies_today["Opp_SF60"] = goalies_today["Opp_SF60"].fillna(FALLBACK_SF60)
 
-    out = df.rename(columns={"NormName":"Goalie"})[
-        ["Goalie","Team","Opponent","Proj Saves","Proj GA"]
+    # Projections
+    goalies_today["Proj Saves"] = goalies_today["Opp_SF60"] * goalies_today["SV%"]
+    goalies_today["Proj GA"]    = goalies_today["Opp_SF60"] * (1.0 - goalies_today["SV%"])
+
+    # --- DraftKings scoring (without win/shutout for now) ---
+    goalies_today["DK Points"] = (
+        goalies_today["Proj Saves"]*0.7 +
+        goalies_today["Proj GA"]*(-3.5)
+    )
+
+    # --- Merge DK Salary if available ---
+    if not dk_df.empty:
+        dk_goalies = dk_df[dk_df["Position"].str.contains("G")][["NormName","Salary"]]
+        goalies_today = goalies_today.merge(dk_goalies, on="NormName", how="left")
+
+    out = goalies_today.rename(columns={"NormName":"Goalie"})[
+        ["Goalie","Team","Opponent","Salary","Proj Saves","Proj GA","DK Points"]
     ]
     out.to_csv(os.path.join(DATA_DIR, "goalies.csv"), index=False)
     return out
-
 
 def build_stacks(dfs_proj):
     stacks = []
