@@ -219,19 +219,19 @@ def build_stacks(dfs_proj):
 
 # ---------------------------- MAIN ----------------------------
 def main():
-    # Step 1: Ingest baseline (2024–25 CSVs)
+    # Step 1: Ingest baseline (2024–25 stats) if not already done
     baseline_summary = ingest_baseline_if_needed()
     print("✅ Baseline summary:", baseline_summary)
 
-    # Step 2: Fetch today’s projected lineups (2025–26 API)
+    # Step 2: Fetch today’s lineups (2025–26, API-driven)
     lineups = fetch_lineups()
     print("✅ Lineups status:", lineups.get("status"), "Teams:", lineups.get("count"))
 
-    # Step 3: Join lineups with 2024–25 baseline stats
+    # Step 3: Join lineups with baseline skater stats
     merged_lineups = join_lineups_with_baseline(lineups)
     print("✅ Merged lineups shape:", getattr(merged_lineups, "shape", None))
 
-    # Step 4: Tag rookies / missing-history players
+    # Step 4: Load baseline players parquet and tag rookies/missing-history players
     _, _, _, _, players_df = load_processed()
     merged_lineups = tag_missing_baseline(merged_lineups, players_df)
     missing_df = players_missing_baseline(merged_lineups)
@@ -243,28 +243,38 @@ def main():
 
     print("🚀 Starting ADP NHL DFS Model")
 
-    # Step 5: Load DraftKings salaries
+    # Step 5: Load DK salaries
     dk_df = load_dk_salaries()
-    if dk_df.empty: 
+    if dk_df.empty:
         return
 
-    # Step 6: Get today’s schedule & opponents
+    # Step 6: Get today’s NHL schedule
     schedule_df = get_today_schedule()
     if schedule_df.empty:
         return
     opp_map = build_opp_map(schedule_df)
 
-    # Step 7: Pull 2025–26 live stats (NST)
-    print("📊 Fetching 2025–26 NST stats...")
-    from adp_nhl.utils.nst import get_team_stats, fetch_nst_player_stats_multi, get_goalie_stats
-    team_stats = get_team_stats()
-    nst_df = fetch_nst_player_stats_multi(pd.unique(schedule_df[["Home","Away"]].values.ravel()))
-    goalie_df = get_goalie_stats()
+    # --- NST INTEGRATION START ---
+    print("📊 Fetching NST team stats...")
+    team_stats = nst_scraper.get_team_stats(CURR_SEASON)
 
-    # Step 8: Use API lineups for line context
-    lines_df = pd.DataFrame(lineups.get("players", [])) if "players" in lineups else pd.DataFrame()
+    print("📊 Fetching NST skater stats...")
+    nst_players = []
+    for team in pd.unique(schedule_df[["Home","Away"]].values.ravel()):
+        # Last 10 games
+        nst_players.append(nst_scraper.get_team_players(team, CURR_SEASON, tgp=10))
+        # Season-to-date
+        nst_players.append(nst_scraper.get_team_players(team, CURR_SEASON))
+    nst_df = pd.concat(nst_players, ignore_index=True)
 
-    # Step 9: Build projections
+    print("📊 Fetching NST goalie stats...")
+    goalie_df = nst_scraper.get_goalies(CURR_SEASON)
+    # --- NST INTEGRATION END ---
+
+    print("📊 Fetching line assignments...")
+    lines_df = get_all_lines(schedule_df)
+
+    # Step 7: Build projections
     print("🛠️ Building skater projections...")
     dfs_proj = build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map)
 
