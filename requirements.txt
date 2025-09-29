@@ -7,3 +7,4 @@ numpy
 gspread
 oauth2client
 openpyxl
+pyarrow
