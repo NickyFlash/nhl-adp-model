@@ -188,39 +188,40 @@ def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
     return df
 
 
-def build_goalies(goalie_sv_df, team_stats, opp_map, dk_df):
-    goalies_today = goalie_sv_df.copy()
-    if goalies_today.empty:
+def build_goalies(goalie_df, team_stats, opp_map, dk_df):
+    if goalie_df.empty:
         print("⚠️ No goalie stats found, skipping goalie projections...")
         return pd.DataFrame()
 
-    # Map opponents
-    goalies_today["Opponent"] = goalies_today["Team"].map(opp_map)
-
-    # Merge opponent SF/60 for save projections
-    goalies_today = goalies_today.merge(
+    goalie_df["Opponent"] = goalie_df["Team"].map(opp_map)
+    goalie_df = goalie_df.merge(
         team_stats[["Team","SF/60"]].rename(columns={"Team":"Opponent","SF/60":"Opp_SF60"}),
         on="Opponent", how="left"
     )
-    goalies_today["Opp_SF60"] = goalies_today["Opp_SF60"].fillna(FALLBACK_SF60)
+    goalie_df["Opp_SF60"] = goalie_df["Opp_SF60"].fillna(FALLBACK_SF60)
+
+    # --- blended SV% for projections ---
+    def blend_sv(row):
+        num, den = 0.0, 0.0
+        if pd.notna(row.get("SV_recent")): num += 0.50 * row["SV_recent"]; den += 0.50
+        if pd.notna(row.get("SV_season")): num += 0.35 * row["SV_season"]; den += 0.35
+        if pd.notna(row.get("SV_last")):   num += 0.15 * row["SV_last"];   den += 0.15
+        return num/den if den > 0 else LEAGUE_AVG_SV
+
+    goalie_df["SV_blend"] = goalie_df.apply(blend_sv, axis=1)
 
     # Projections
-    goalies_today["Proj Saves"] = goalies_today["Opp_SF60"] * goalies_today["SV%"]
-    goalies_today["Proj GA"]    = goalies_today["Opp_SF60"] * (1.0 - goalies_today["SV%"])
+    goalie_df["Proj Saves"] = goalie_df["Opp_SF60"] * goalie_df["SV_blend"]
+    goalie_df["Proj GA"]    = goalie_df["Opp_SF60"] * (1.0 - goalie_df["SV_blend"])
+    goalie_df["DK Points"]  = goalie_df["Proj Saves"]*0.7 + goalie_df["Proj GA"]*(-3.5)
 
-    # --- DraftKings scoring (without win/shutout for now) ---
-    goalies_today["DK Points"] = (
-        goalies_today["Proj Saves"]*0.7 +
-        goalies_today["Proj GA"]*(-3.5)
-    )
-
-    # --- Merge DK Salary if available ---
+    # Merge DK salaries if available
     if not dk_df.empty:
         dk_goalies = dk_df[dk_df["Position"].str.contains("G")][["NormName","Salary"]]
-        goalies_today = goalies_today.merge(dk_goalies, on="NormName", how="left")
+        goalie_df = goalie_df.merge(dk_goalies, on="NormName", how="left")
 
-    out = goalies_today.rename(columns={"NormName":"Goalie"})[
-        ["Goalie","Team","Opponent","Salary","Proj Saves","Proj GA","DK Points"]
+    out = goalie_df.rename(columns={"NormName":"Goalie"})[
+        ["Goalie","Team","Opponent","Salary","SV_season","Proj Saves","Proj GA","DK Points"]
     ]
     out.to_csv(os.path.join(DATA_DIR, "goalies.csv"), index=False)
     return out
