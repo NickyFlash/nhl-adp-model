@@ -17,7 +17,7 @@ def upload_to_sheets(sheet_name, tabs_dict):
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(creds)
 
-    # open the target sheet (must already exist & be shared with the service account email)
+    # Open the target sheet (must already exist & be shared with the service account email)
     sh = client.open(sheet_name)
 
     for tab_name, df in tabs_dict.items():
@@ -30,4 +30,8 @@ def upload_to_sheets(sheet_name, tabs_dict):
         if df is None or df.empty:
             ws.update([["(no rows)"]])
         else:
-            ws.update([df.columns.tolist()] + df.values.tolist())
+            # Convert DataFrame into list of lists for upload
+            values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
+            ws.update(values)
+
+    print(f"✅ Exported projections to Google Sheets ({sheet_name})")
