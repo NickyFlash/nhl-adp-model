@@ -1,7 +1,7 @@
 import os, re, time, requests
 import pandas as pd
 from datetime import datetime
-from adp_nhl.utils.joins import load_processed
+from adp_nhl.utils.common import norm_name
 
 # Config
 DATA_DIR = "data"
@@ -12,7 +12,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (ADP Free Model)"}
 TIMEOUT = 60
 LEAGUE_AVG_SV = 0.905
 
-# Fall back values if NST fails
+# Fallback values if NST fails
 FALLBACK_CA60  = 58.0
 FALLBACK_xGA60 = 2.65
 FALLBACK_SF60  = 31.0
@@ -40,7 +40,7 @@ def http_get_cached(url, tag, sleep=3):
 # --- Team Stats ---
 def get_team_stats(season):
     url = f"https://www.naturalstattrick.com/teamtable.php?fromseason={season}&thruseason={season}&stype=2&sit=all"
-    html = http_get_cached(url, tag=f"nst_teamtable_{season}", sleep=SETTINGS["sleep_nst"])
+    html = http_get_cached(url, tag=f"nst_teamtable_{season}", sleep=3)
     if html is None:
         print("⚠️ NST team stats unavailable; using league fallbacks.")
         return pd.DataFrame(columns=["Team","CF/60","CA/60","SF/60","xGF/60","xGA/60"])
@@ -49,7 +49,7 @@ def get_team_stats(season):
         out = []
         for row in rows:
             m = re.search(r'teamreport\.php\?team=([A-Z]{2,3})', row)
-            if not m: 
+            if not m:
                 continue
             abbr = m.group(1)
 
@@ -104,6 +104,7 @@ def _parse_nst_player_rows(html):
         hdcf60= pick_num("HDCF")
         out.append({
             "PlayerRaw": pname,
+            "NormName": norm_name(pname),
             "G/60": g60, "A/60": a60, "SOG/60": sog60, "BLK/60": blk60,
             "CF/60": cf60, "xGF/60": xgf60, "HDCF/60": hdcf60
         })
@@ -120,6 +121,7 @@ def get_team_players(team_code, season_code, tgp=None):
         return pd.DataFrame()
     return _parse_nst_player_rows(html)
 
+# --- Goalie Stats ---
 def get_goalies(season, last_season=None):
     """
     Pull goalie stats for season, last 10 GP, and last season.
@@ -134,7 +136,7 @@ def get_goalies(season, last_season=None):
             qs += f"&tgp={tgp}"
         url = f"https://www.naturalstattrick.com/playerteams.php?{qs}"
         tag = f"nst_goalies_{season}_{tgp or 'all'}"
-        html = http_get_cached(url, tag=tag, sleep=SETTINGS["sleep_nst"])
+        html = http_get_cached(url, tag=tag, sleep=3)
         if html is None:
             return pd.DataFrame()
 
@@ -147,21 +149,18 @@ def get_goalies(season, last_season=None):
             pname = m_name.group(1).strip()
             sv_match = re.search(r'SV%[^0-9]*([0-9]*\.?[0-9]+)', row, flags=re.IGNORECASE)
             sv_pct = float(sv_match.group(1))/100.0 if sv_match else None
-            out.append({"PlayerRaw": pname, "NormName": norm_name(pname), "SV%": sv_pct})
+            out.append({
+                "PlayerRaw": pname,
+                "NormName": norm_name(pname),
+                "SV%": sv_pct
+            })
         return pd.DataFrame(out)
 
-    season_df = fetch_goalie_stats(season).rename(columns={"SV%":"SV_season"})
-    recent_df = fetch_goalie_stats(season, tgp=10).rename(columns={"SV%":"SV_recent"})
-    last_df   = fetch_goalie_stats(last_season).rename(columns={"SV%":"SV_last"})
+    season_df = fetch_goalie_stats(season).rename(columns={"SV%": "SV_season"})
+    recent_df = fetch_goalie_stats(season, tgp=10).rename(columns={"SV%": "SV_recent"})
+    last_df   = fetch_goalie_stats(last_season).rename(columns={"SV%": "SV_last"})
 
     merged = season_df.merge(recent_df[["NormName","SV_recent"]], on="NormName", how="left")
     merged = merged.merge(last_df[["NormName","SV_last"]], on="NormName", how="left")
 
     return merged
-    
-🟢 Step 3. Import into main.py
-At the top of main.py, add:
-
-python
-Copy code
-from adp_nhl.utils import nst_scraper
