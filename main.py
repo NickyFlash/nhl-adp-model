@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 ADP NHL DFS / Betting Model - Master Script
-Outputs: dfs_projections.csv, goalies.csv, top_stacks.csv (+ GSheet export)
+Outputs: dfs_projections.csv, goalies.csv, top_stacks.csv (+ helper snapshots, GSheet export)
 """
 
-import os, pandas as pd
+import os, requests
+import pandas as pd
 from datetime import date, datetime
 
-# --- ADP NHL utils ---
+# --- ADP NHL baseline + lineups helpers ---
 from adp_nhl.utils.etl import ingest_baseline_if_needed
 from adp_nhl.utils.lineups_api import fetch_lineups
 from adp_nhl.utils.joins import join_lineups_with_baseline, load_processed
@@ -18,7 +19,36 @@ from adp_nhl.utils.export_sheets import upload_to_sheets
 
 # ---------------------------- CONFIG ----------------------------
 DATA_DIR = "data"
+RAW_DIR = os.path.join(DATA_DIR, "raw")
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(RAW_DIR, exist_ok=True)
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (ADP Free Model)"}
+TIMEOUT = 60
+
+# Auto-detect current and last NHL season
+today = date.today()
+year = today.year
+month = today.month
+
+if month < 7:  # NHL seasons run Oct–Jun, rollover in July
+    start = year - 1
+    end   = year
+else:
+    start = year
+    end   = year + 1
+
+CURR_SEASON = f"{start}{end}"
+LAST_SEASON = f"{start-1}{start}"
+
+LEAGUE_AVG_SV = 0.905
+GOALIE_TOI_MIN = 60.0
+
+# League fallback averages
+FALLBACK_SF60  = 31.0
+FALLBACK_xGF60 = 2.95
+FALLBACK_CA60  = 58.0
+FALLBACK_xGA60 = 2.65
 
 SETTINGS = {
     "DK_points": {"Goal": 8.5, "Assist": 5.0, "SOG": 1.5, "Block": 1.3},
@@ -29,11 +59,9 @@ SETTINGS = {
     },
     "F_fallback": {"G60": 0.45, "A60": 0.80, "SOG60": 5.2, "BLK60": 1.0},
     "D_fallback": {"G60": 0.20, "A60": 0.70, "SOG60": 3.2, "BLK60": 4.0},
+    "sleep_nst": 3.0,
+    "sleep_lines": 2.0
 }
-
-FALLBACK_SF60  = 31.0
-FALLBACK_xGA60 = 2.65
-LEAGUE_AVG_SV  = 0.905
 
 # ---------------------------- HELPERS ----------------------------
 def guess_role(pos: str) -> str:
@@ -43,9 +71,66 @@ def guess_role(pos: str) -> str:
     if "D" in p: return "D"
     return "F"
 
-# ---------------------------- PROJECTIONS ----------------------------
+def get_today_schedule():
+    url = "https://statsapi.web.nhl.com/api/v1/schedule"
+    try:
+        js = requests.get(url, timeout=30).json()
+    except Exception as e:
+        print("❌ Schedule fetch failed:", e)
+        return pd.DataFrame()
+    games = []
+    for d in js.get("dates", []):
+        for g in d.get("games", []):
+            home = g["teams"]["home"]["team"].get("triCode") or g["teams"]["home"]["team"].get("abbreviation")
+            away = g["teams"]["away"]["team"].get("triCode") or g["teams"]["away"]["team"].get("abbreviation")
+            if home and away:
+                games.append({"Home": home, "Away": away})
+    df = pd.DataFrame(games)
+    if df.empty:
+        print("ℹ️ No NHL games on the schedule today.")
+        return df
+    df.to_csv(os.path.join(DATA_DIR, "schedule_today.csv"), index=False)
+    return df
+
+def build_opp_map(schedule_df: pd.DataFrame):
+    opp = {}
+    for _, g in schedule_df.iterrows():
+        h, a = g["Home"], g["Away"]
+        opp[h] = a
+        opp[a] = h
+    return opp
+
+# ---------------------------- DRAFTKINGS ----------------------------
+def load_dk_salaries():
+    path = os.path.join(DATA_DIR, "dk_salaries.csv")
+    if not os.path.exists(path):
+        print("❌ Missing dk_salaries.csv. Download from DraftKings and save to /data/")
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        df = pd.read_csv(path, sep=";")
+    ren = {}
+    for c in df.columns:
+        lc = c.lower()
+        if lc == "name": ren[c] = "Name"
+        if lc == "teamabbrev": ren[c] = "TeamAbbrev"
+        if lc == "position": ren[c] = "Position"
+        if lc == "salary": ren[c] = "Salary"
+    df = df.rename(columns=ren)
+    required = ["Name","TeamAbbrev","Position","Salary"]
+    for r in required:
+        if r not in df.columns:
+            print(f"❌ dk_salaries.csv missing column: {r}")
+            return pd.DataFrame()
+    df["NormName"] = df["Name"].apply(norm_name)
+    return df[required + ["NormName"]]
+
+# ---------------------------- BUILD PROJECTIONS ----------------------------
 def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
     players = []
+
+    # If no salaries available, fallback to using NST players instead
     source_df = dk_df if not dk_df.empty else nst_df.copy()
     if dk_df.empty:
         print("⚠️ DK salaries not found, building projections without salaries...")
@@ -59,14 +144,13 @@ def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
         # Player stats
         nst_row = nst_df[nst_df["NormName"] == nm].head(1)
         if not nst_row.empty:
-            g60 = nst_row.get("G/60", row.get("G/60", SETTINGS["F_fallback"]["G60"]))
-            a60 = nst_row.get("A/60", row.get("A/60", SETTINGS["F_fallback"]["A60"]))
-            s60 = nst_row.get("SOG/60", row.get("SOG/60", SETTINGS["F_fallback"]["SOG60"]))
-            b60 = nst_row.get("BLK/60", row.get("BLK/60", SETTINGS["F_fallback"]["BLK60"]))
-            g60,a60,s60,b60 = g60.values[0],a60.values[0],s60.values[0],b60.values[0]
+            g60 = nst_row["G/60"].values[0]
+            a60 = nst_row["A/60"].values[0]
+            s60 = nst_row["SOG/60"].values[0]
+            b60 = nst_row["BLK/60"].values[0]
         else:
             role = guess_role(pos)
-            fb = SETTINGS["D_fallback"] if role=="D" else SETTINGS["F_fallback"]
+            fb = SETTINGS["D_fallback"] if role == "D" else SETTINGS["F_fallback"]
             g60,a60,s60,b60 = fb["G60"],fb["A60"],fb["SOG60"],fb["BLK60"]
 
         # Opponent adjustment
@@ -98,6 +182,7 @@ def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
             "DK Points": dk_points
         }
 
+        # Only add Salary + Value if salaries exist
         if not dk_df.empty:
             player_dict["Salary"] = row["Salary"]
             player_dict["DFS Value Score"] = dk_points / row["Salary"] * 1000 if row["Salary"] > 0 else 0
@@ -111,9 +196,14 @@ def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
 
 def build_goalies(goalie_df, team_stats, opp_map):
     goalies = []
+    if goalie_df.empty:
+        print("⚠️ No goalie stats found, skipping goalie projections...")
+        return pd.DataFrame()
+
     for _, row in goalie_df.iterrows():
         team = row.get("Team", "")
-        if not team: continue
+        if not team:
+            continue
         opp = opp_map.get(team)
         sv_pct = row.get("SV_season", LEAGUE_AVG_SV)
         opp_stats = team_stats[team_stats.Team == opp]
@@ -122,13 +212,15 @@ def build_goalies(goalie_df, team_stats, opp_map):
         proj_saves = opp_sf * sv_pct
         proj_ga    = opp_sf * (1 - sv_pct)
 
+        dk_points = proj_saves*0.7 - proj_ga*3.5  # DK scoring approx for goalies
+
         goalie_dict = {
             "Goalie": row.get("PlayerRaw", row.get("NormName")),
             "Team": team,
             "Opponent": opp,
             "Proj Saves": proj_saves,
             "Proj GA": proj_ga,
-            "DK Points": proj_saves*0.7 - proj_ga*3.5  # basic DK scoring
+            "DK Points": dk_points
         }
 
         goalies.append(goalie_dict)
@@ -140,9 +232,14 @@ def build_goalies(goalie_df, team_stats, opp_map):
 
 def build_stacks(dfs_proj):
     stacks = []
+    if dfs_proj.empty:
+        print("⚠️ No skater projections available, skipping stacks...")
+        return pd.DataFrame()
+
     for team, grp in dfs_proj.groupby("Team"):
         for line, players in grp.groupby("Line"):
-            if line == "NA": continue
+            if line == "NA": 
+                continue
             pts = players["DK Points"].sum()
 
             stack_dict = {
@@ -166,43 +263,70 @@ def build_stacks(dfs_proj):
 
 # ---------------------------- MAIN ----------------------------
 def main():
-    # Baseline (2024–25)
+    # Step 1: Ingest baseline (2024–25 stats) if not already done
     baseline_summary = ingest_baseline_if_needed()
     print("✅ Baseline summary:", baseline_summary)
 
-    # Lineups (2025–26)
+    # Step 2: Fetch today’s lineups (2025–26, API-driven)
     lineups = fetch_lineups()
     print("✅ Lineups status:", lineups.get("status"), "Teams:", lineups.get("count"))
 
+    # Step 3: Join lineups with baseline skater stats
     merged_lineups = join_lineups_with_baseline(lineups)
+    print("✅ Merged lineups shape:", getattr(merged_lineups, "shape", None))
+
+    # Step 4: Load baseline players parquet and tag rookies/missing-history players
     _, _, _, _, players_df = load_processed()
     merged_lineups = tag_missing_baseline(merged_lineups, players_df)
     missing_df = players_missing_baseline(merged_lineups)
     print("⚠️ Missing-baseline players:", len(missing_df))
+    try:
+        print(missing_df.head(15).to_string(index=False))
+    except Exception:
+        pass
 
-    # NHL schedule
-    from adp_nhl.utils.common import build_opp_map, get_today_schedule
+    print("🚀 Starting ADP NHL DFS Model")
+
+    # Step 5: Load DK salaries (optional)
+    dk_df = load_dk_salaries()
+
+    # Step 6: Get today’s NHL schedule
     schedule_df = get_today_schedule()
-    if schedule_df.empty: return
+    if schedule_df.empty:
+        return
     opp_map = build_opp_map(schedule_df)
 
-    # NST stats
-    team_stats = nst_scraper.get_team_stats(baseline_summary["season"])
+    # --- NST INTEGRATION ---
+    print("📊 Fetching NST team stats...")
+    team_stats = nst_scraper.get_team_stats(CURR_SEASON)
+
+    print("📊 Fetching NST skater stats...")
     nst_players = []
     for team in pd.unique(schedule_df[["Home","Away"]].values.ravel()):
-        nst_players.append(nst_scraper.get_team_players(team, baseline_summary["season"], tgp=10))
-        nst_players.append(nst_scraper.get_team_players(team, baseline_summary["season"]))
+        nst_players.append(nst_scraper.get_team_players(team, CURR_SEASON, tgp=10))
+        nst_players.append(nst_scraper.get_team_players(team, CURR_SEASON))
     nst_df = pd.concat(nst_players, ignore_index=True)
-    goalie_df = nst_scraper.get_goalies(baseline_summary["season"])
 
-    # Build outputs
-    dfs_proj = build_skaters(pd.DataFrame(), nst_df, team_stats, merged_lineups, opp_map)
+    print("📊 Fetching NST goalie stats...")
+    goalie_df = nst_scraper.get_goalies(CURR_SEASON, last_season=LAST_SEASON)
+
+    print("📊 Fetching line assignments...")
+    from adp_nhl.utils.lineups_api import get_all_lines
+    lines_df = get_all_lines(schedule_df)
+
+    # Step 7: Build projections
+    print("🛠️ Building skater projections...")
+    dfs_proj = build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map)
+
+    print("🛠️ Building goalie projections...")
     goalie_proj = build_goalies(goalie_df, team_stats, opp_map)
+
+    print("🛠️ Building stack projections...")
     stack_proj = build_stacks(dfs_proj)
 
     print("✅ All outputs saved to /data")
 
-    # Export to Google Sheets
+    # --- EXPORT TO GOOGLE SHEETS ---
     print("📤 Uploading projections to Google Sheets...")
     tabs = {
         "Skaters": dfs_proj,
