@@ -4,9 +4,10 @@ ADP NHL DFS / Betting Model - Master Script
 Outputs: dfs_projections.csv, goalies.csv, top_stacks.csv (+ helper snapshots, GSheet export)
 """
 
-import os, requests
+import os, requests, time
 import pandas as pd
-from datetime import date, datetime
+from bs4 import BeautifulSoup
+from datetime import date
 
 # --- ADP NHL baseline + lineups helpers ---
 from adp_nhl.utils.etl import ingest_baseline_if_needed
