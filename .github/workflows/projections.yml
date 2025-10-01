@@ -28,16 +28,21 @@ jobs:
         env:
           GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
         run: |
+          mkdir -p data
           python main.py
 
       - name: Upload data outputs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: projections-data
           path: data/*.csv
+          if-no-files-found: ignore
 
       - name: Upload Excel workbook
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: projections-excel
           path: data/*.xlsx
+          if-no-files-found: ignore
