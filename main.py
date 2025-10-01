@@ -71,26 +71,50 @@ def guess_role(pos: str) -> str:
     if "D" in p: return "D"
     return "F"
 
-def get_today_schedule():
-    url = "https://statsapi.web.nhl.com/api/v1/schedule"
-    try:
-        js = requests.get(url, timeout=30).json()
-    except Exception as e:
-        print("❌ Schedule fetch failed:", e)
-        return pd.DataFrame()
-    games = []
-    for d in js.get("dates", []):
-        for g in d.get("games", []):
-            home = g["teams"]["home"]["team"].get("triCode") or g["teams"]["home"]["team"].get("abbreviation")
-            away = g["teams"]["away"]["team"].get("triCode") or g["teams"]["away"]["team"].get("abbreviation")
-            if home and away:
-                games.append({"Home": home, "Away": away})
-    df = pd.DataFrame(games)
-    if df.empty:
-        print("ℹ️ No NHL games on the schedule today.")
-        return df
-    df.to_csv(os.path.join(DATA_DIR, "schedule_today.csv"), index=False)
-    return df
+def get_today_schedule(max_retries=3):
+    today_str = date.today().strftime("%Y-%m-%d")
+    endpoints = [
+        f"https://statsapi.web.nhl.com/api/v1/schedule?date={today_str}",
+        f"https://api-web.nhle.com/v1/schedule?date={today_str}",
+        f"https://sports.algobook.info/api/v1/nhl/schedule/{today_str}"
+    ]
+    for endpoint in endpoints:
+        tries = 0
+        while tries < max_retries:
+            try:
+                resp = requests.get(endpoint, timeout=30)
+                resp.raise_for_status()
+                js = resp.json()
+                games = []
+                # parse depending on structure
+                if "dates" in js:
+                    for d in js.get("dates", []):
+                        for g in d.get("games", []):
+                            home = g["teams"]["home"]["team"].get("triCode")
+                            away = g["teams"]["away"]["team"].get("triCode")
+                            if home and away:
+                                games.append({"Home": home, "Away": away})
+                elif "gameWeeks" in js:
+                    # Algobook structure fallback
+                    for w in js["gameWeeks"]:
+                        for g in w.get("games", []):
+                            home = g.get("homeTeam", {}).get("abbrev")
+                            away = g.get("awayTeam", {}).get("abbrev")
+                            if home and away:
+                                games.append({"Home": home, "Away": away})
+                # else structure may vary — you can inspect
+                df = pd.DataFrame(games)
+                if not df.empty:
+                    df.to_csv(os.path.join(DATA_DIR, "schedule_today.csv"), index=False)
+                    return df
+                break  # no games, but endpoint responded
+            except Exception as e:
+                print(f"⚠️ Schedule endpoint {endpoint} attempt {tries+1} failed: {e}")
+                tries += 1
+                time.sleep(3)
+        # try next endpoint
+    print("❌ All schedule endpoints failed or no games found.")
+    return pd.DataFrame()
 
 def build_opp_map(schedule_df: pd.DataFrame):
     opp = {}
