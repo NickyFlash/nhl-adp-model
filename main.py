@@ -289,32 +289,36 @@ def main():
 
     # Step 5: Load DK salaries (optional)
     dk_df = load_dk_salaries()
+    if dk_df.empty:
+        print("⚠️ No DraftKings salaries found, continuing without salary/value context.")
 
     # Step 6: Get today’s NHL schedule
     schedule_df = get_today_schedule()
     if schedule_df.empty:
+        print("ℹ️ No games today, skipping projections.")
         return
     opp_map = build_opp_map(schedule_df)
 
-    # --- NST INTEGRATION ---
+    # Step 7: Fetch NST stats
     print("📊 Fetching NST team stats...")
     team_stats = nst_scraper.get_team_stats(CURR_SEASON)
 
     print("📊 Fetching NST skater stats...")
     nst_players = []
     for team in pd.unique(schedule_df[["Home","Away"]].values.ravel()):
+        # Last 10 games
         nst_players.append(nst_scraper.get_team_players(team, CURR_SEASON, tgp=10))
+        # Season-to-date
         nst_players.append(nst_scraper.get_team_players(team, CURR_SEASON))
-    nst_df = pd.concat(nst_players, ignore_index=True)
+    nst_df = pd.concat(nst_players, ignore_index=True) if nst_players else pd.DataFrame()
 
     print("📊 Fetching NST goalie stats...")
-    goalie_df = nst_scraper.get_goalies(CURR_SEASON, last_season=LAST_SEASON)
+    goalie_df = nst_scraper.get_goalies(CURR_SEASON, LAST_SEASON)
 
     print("📊 Fetching line assignments...")
-    from adp_nhl.utils.lineups_api import get_all_lines
     lines_df = get_all_lines(schedule_df)
 
-    # Step 7: Build projections
+    # Step 8: Build projections
     print("🛠️ Building skater projections...")
     dfs_proj = build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map)
 
@@ -326,7 +330,8 @@ def main():
 
     print("✅ All outputs saved to /data")
 
-    # --- EXPORT TO GOOGLE SHEETS ---
+    # Step 9: Export to Google Sheets
+    from adp_nhl.utils.export_sheets import upload_to_sheets
     print("📤 Uploading projections to Google Sheets...")
     tabs = {
         "Skaters": dfs_proj,
@@ -335,7 +340,7 @@ def main():
         "Teams": team_stats,
         "NST_Raw": nst_df
     }
-    upload_to_sheets("ADP NHL Projections", tabs)
+    upload_to_sheets("ADP NHL Projections", tabs)  # <-- replace with your exact sheet name
 
 if __name__=="__main__":
     main()
