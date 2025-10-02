@@ -6,7 +6,7 @@ Outputs: dfs_projections.csv, goalies.csv, top_stacks.csv (+ helper snapshots)
 
 import os, requests, time
 import pandas as pd
-from datetime import date, datetime
+from datetime import date, datetime   # ✅ fixed import
 
 # --- ADP NHL baseline + lineups helpers ---
 from adp_nhl.utils.etl import ingest_baseline_if_needed
@@ -91,9 +91,6 @@ def load_dk_salaries():
 
 # ---------------------------- NHL SCHEDULE ----------------------------
 def get_today_schedule():
-    """
-    Pull today's NHL schedule using stable NHL API endpoint.
-    """
     date_str = datetime.today().strftime("%Y-%m-%d")
     endpoint = f"https://api-web.nhle.com/v1/schedule/{date_str}"
 
@@ -126,9 +123,6 @@ def build_opp_map(schedule_df: pd.DataFrame):
 
 # ---------------------------- LINE ASSIGNMENTS ----------------------------
 def get_all_lines(schedule_df):
-    """
-    Pull line assignments from lineups API for today's teams.
-    """
     games = pd.concat([schedule_df["Home"], schedule_df["Away"]]).unique()
     all_rows = []
     for team in games:
@@ -137,6 +131,8 @@ def get_all_lines(schedule_df):
             resp = requests.get(url, timeout=30)
             resp.raise_for_status()
             js = resp.json()
+            if isinstance(js, list):   # ✅ defensive patch
+                js = js[0] if js else {}
             for line in js.get("forwards", []) + js.get("defense", []):
                 for player in line.get("players", []):
                     all_rows.append({
@@ -162,6 +158,7 @@ def get_all_lines(schedule_df):
 # ---------------------------- BUILD PROJECTIONS ----------------------------
 def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
     players = []
+    team_stats = team_stats.rename(columns={c: "Team" if c.lower()=="team" else c for c in team_stats.columns})  # ✅ normalize
 
     source_df = dk_df if not dk_df.empty else nst_df.copy()
     if dk_df.empty:
@@ -225,6 +222,9 @@ def build_goalies(goalie_df, team_stats, opp_map):
     if goalie_df.empty:
         print("⚠️ No goalie stats found, skipping goalie projections...")
         return pd.DataFrame()
+
+    # ✅ normalize Team col if lowercase
+    team_stats = team_stats.rename(columns={c: "Team" if c.lower()=="team" else c for c in team_stats.columns})
 
     for _, row in goalie_df.iterrows():
         team = row.get("Team", "")
@@ -306,6 +306,7 @@ def main():
 
     print("📊 Fetching NST team stats...")
     team_stats = nst_scraper.get_team_stats(CURR_SEASON)
+    team_stats = team_stats.rename(columns={c: "Team" if c.lower()=="team" else c for c in team_stats.columns})  # ✅ normalize
 
     print("📊 Fetching NST skater stats...")
     nst_players = []
