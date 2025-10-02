@@ -1,4 +1,4 @@
-import os, re, time, requests
+import os, time, requests
 import pandas as pd
 from datetime import datetime
 from adp_nhl.utils.common import norm_name
@@ -45,30 +45,23 @@ def get_team_stats(season):
         print("⚠️ NST team stats unavailable; using league fallbacks.")
         return pd.DataFrame(columns=["Team","CF/60","CA/60","SF/60","xGF/60","xGA/60"])
     try:
-        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.DOTALL|re.IGNORECASE)
-        out = []
-        for row in rows:
-            m = re.search(r'teamreport\.php\?team=([A-Z]{2,3})', row)
-            if not m:
-                continue
-            abbr = m.group(1)
+        tables = pd.read_html(html)
+        if not tables:
+            raise ValueError("No tables parsed from NST team page")
 
-            def num(label, fallback=None):
-                m2 = re.search(rf"{label}[^0-9]*([0-9]+\.[0-9]+)", row, flags=re.IGNORECASE)
-                return float(m2.group(1)) if m2 else fallback
+        df = tables[0]
+        df.columns = [c.strip() for c in df.columns]
 
-            out.append({
-                "Team": abbr,  # ✅ force standard name
-                "CF/60":  num("CF/60"),
-                "CA/60":  num("CA/60")  or FALLBACK_CA60,
-                "SF/60":  num("SF/60")  or FALLBACK_SF60,
-                "xGF/60": num("xGF/60") or FALLBACK_xGF60,
-                "xGA/60": num("xGA/60") or FALLBACK_xGA60,
-            })
-        df = pd.DataFrame(out)
-        # ✅ ensure Team col exists (fixes AttributeError in main.py)
+        # Ensure correct naming
         if "Team" not in df.columns and "Tm" in df.columns:
             df = df.rename(columns={"Tm": "Team"})
+
+        keep_cols = ["Team","CF/60","CA/60","SF/60","xGF/60","xGA/60"]
+        for col in keep_cols:
+            if col not in df.columns:
+                df[col] = None
+
+        df = df[keep_cols].copy()
         df.to_csv(os.path.join(DATA_DIR, "team_stats.csv"), index=False)
         return df
     except Exception as e:
@@ -76,43 +69,6 @@ def get_team_stats(season):
         return pd.DataFrame(columns=["Team","CF/60","CA/60","SF/60","xGF/60","xGA/60"])
 
 # --- Player Stats (Skaters) ---
-def _parse_nst_player_rows(html):
-    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.IGNORECASE|re.DOTALL)
-    out = []
-    for row in rows:
-        m_name = re.search(r'player(?:\.php\?id=|id=)\d+[^>]*>([^<]+)</a>', row, flags=re.IGNORECASE)
-        if not m_name:
-            continue
-        pname = m_name.group(1).strip()
-
-        def pick_num(label):
-            pats = [
-                rf'{label}\s*/\s*60[^0-9\-]*([0-9]*\.?[0-9]+)',
-                rf'{label}60[^0-9\-]*([0-9]*\.?[0-9]+)',
-                rf'{label}[^0-9\-]*([0-9]*\.?[0-9]+)'
-            ]
-            for pat in pats:
-                m = re.search(pat, row, flags=re.IGNORECASE)
-                if m:
-                    try: return float(m.group(1))
-                    except: pass
-            return None
-
-        g60   = pick_num("G")
-        a60   = pick_num("A")
-        sog60 = pick_num("S")
-        blk60 = pick_num("Blk")
-        cf60  = pick_num("CF")
-        xgf60 = pick_num("xGF")
-        hdcf60= pick_num("HDCF")
-        out.append({
-            "PlayerRaw": pname,
-            "NormName": norm_name(pname),
-            "G/60": g60, "A/60": a60, "SOG/60": sog60, "BLK/60": blk60,
-            "CF/60": cf60, "xGF/60": xgf60, "HDCF/60": hdcf60
-        })
-    return pd.DataFrame(out)
-
 def get_team_players(team_code, season_code, tgp=None):
     qs = f"team={team_code}&sit=all&fromseason={season_code}&thruseason={season_code}"
     if tgp:
@@ -122,14 +78,40 @@ def get_team_players(team_code, season_code, tgp=None):
     html = http_get_cached(url, tag=tag)
     if html is None:
         return pd.DataFrame()
-    return _parse_nst_player_rows(html)
+
+    try:
+        tables = pd.read_html(html)
+        if not tables:
+            return pd.DataFrame()
+
+        df = tables[0]
+        df.columns = [c.strip() for c in df.columns]
+
+        # Map to consistent names
+        cols_map = {
+            "Player": "PlayerRaw",
+            "G/60": "G/60",
+            "A/60": "A/60",
+            "S/60": "SOG/60",
+            "CF/60": "CF/60",
+            "xGF/60": "xGF/60",
+            "HDCF/60": "HDCF/60",
+            "Blk/60": "BLK/60"
+        }
+
+        for c in cols_map:
+            if c not in df.columns:
+                df[c] = None
+
+        out = df.rename(columns=cols_map)
+        out["NormName"] = out["PlayerRaw"].apply(norm_name)
+        return out[list(cols_map.values()) + ["NormName"]]
+    except Exception as e:
+        print("❌ Failed NST player parse:", e)
+        return pd.DataFrame()
 
 # --- Goalie Stats ---
 def get_goalies(season, last_season=None):
-    """
-    Pull goalie stats for season, last 10 GP, and last season.
-    Do not blend here — just return splits so projections can weight them.
-    """
     if not last_season:
         last_season = str(int(season[:4]) - 1) + str(int(season[:4]))
 
@@ -142,22 +124,28 @@ def get_goalies(season, last_season=None):
         html = http_get_cached(url, tag=tag, sleep=3)
         if html is None:
             return pd.DataFrame()
+        try:
+            tables = pd.read_html(html)
+            if not tables:
+                return pd.DataFrame()
+            df = tables[0]
+            df.columns = [c.strip() for c in df.columns]
 
-        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.IGNORECASE|re.DOTALL)
-        out = []
-        for row in rows:
-            m_name = re.search(r'player(?:\.php\?id=|id=)\d+[^>]*>([^<]+)</a>', row, flags=re.IGNORECASE)
-            if not m_name:
-                continue
-            pname = m_name.group(1).strip()
-            sv_match = re.search(r'SV%[^0-9]*([0-9]*\.?[0-9]+)', row, flags=re.IGNORECASE)
-            sv_pct = float(sv_match.group(1))/100.0 if sv_match else None
-            out.append({
-                "PlayerRaw": pname,
-                "NormName": norm_name(pname),
-                "SV%": sv_pct
+            if "Player" not in df.columns:
+                return pd.DataFrame()
+
+            if "SV%" not in df.columns:
+                df["SV%"] = None
+
+            out = pd.DataFrame({
+                "PlayerRaw": df["Player"],
+                "NormName": df["Player"].apply(norm_name),
+                "SV%": df["SV%"].astype(str).str.replace("%","").astype(float)/100.0
             })
-        return pd.DataFrame(out)
+            return out
+        except Exception as e:
+            print("❌ Failed NST goalie parse:", e)
+            return pd.DataFrame()
 
     season_df = fetch_goalie_stats(season).rename(columns={"SV%": "SV_season"})
     recent_df = fetch_goalie_stats(season, tgp=10).rename(columns={"SV%": "SV_recent"})
@@ -165,5 +153,4 @@ def get_goalies(season, last_season=None):
 
     merged = season_df.merge(recent_df[["NormName","SV_recent"]], on="NormName", how="left")
     merged = merged.merge(last_df[["NormName","SV_last"]], on="NormName", how="left")
-
     return merged
