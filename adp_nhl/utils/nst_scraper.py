@@ -58,7 +58,7 @@ def get_team_stats(season):
                 return float(m2.group(1)) if m2 else fallback
 
             out.append({
-                "Team": abbr,
+                "Team": abbr,  # ✅ force standard name
                 "CF/60":  num("CF/60"),
                 "CA/60":  num("CA/60")  or FALLBACK_CA60,
                 "SF/60":  num("SF/60")  or FALLBACK_SF60,
@@ -66,6 +66,9 @@ def get_team_stats(season):
                 "xGA/60": num("xGA/60") or FALLBACK_xGA60,
             })
         df = pd.DataFrame(out)
+        # ✅ ensure Team col exists (fixes AttributeError in main.py)
+        if "Team" not in df.columns and "Tm" in df.columns:
+            df = df.rename(columns={"Tm": "Team"})
         df.to_csv(os.path.join(DATA_DIR, "team_stats.csv"), index=False)
         return df
     except Exception as e:
