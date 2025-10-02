@@ -17,7 +17,7 @@ from adp_nhl.utils.common import norm_name
 from adp_nhl.utils import nst_scraper
 from adp_nhl.utils.export_sheets import upload_to_sheets
 
-# ---------------------------- CONFIG ----------------------------
+# ---------------- CONFIG ----------------
 DATA_DIR = "data"
 RAW_DIR = os.path.join(DATA_DIR, "raw")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -63,7 +63,7 @@ def guess_role(pos: str) -> str:
     if "D" in p: return "D"
     return "F"
 
-# ---------------------------- DRAFTKINGS ----------------------------
+# ---------------- DRAFTKINGS ----------------
 def load_dk_salaries():
     path = os.path.join(DATA_DIR, "dk_salaries.csv")
     if not os.path.exists(path):
@@ -89,14 +89,10 @@ def load_dk_salaries():
     df["NormName"] = df["Name"].apply(norm_name)
     return df[required + ["NormName"]]
 
-# ---------------------------- NHL SCHEDULE ----------------------------
+# ---------------- NHL SCHEDULE ----------------
 def get_today_schedule():
-    """
-    Pull today's NHL schedule using stable NHL API endpoint.
-    """
     date_str = datetime.today().strftime("%Y-%m-%d")
     endpoint = f"https://api-web.nhle.com/v1/schedule/{date_str}"
-
     for attempt in range(3):
         try:
             resp = requests.get(endpoint, timeout=30)
@@ -124,11 +120,8 @@ def build_opp_map(schedule_df: pd.DataFrame):
         opp[h], opp[a] = a, h
     return opp
 
-# ---------------------------- LINE ASSIGNMENTS ----------------------------
+# ---------------- LINE ASSIGNMENTS ----------------
 def get_all_lines(schedule_df):
-    """
-    Pull line assignments from lineups API for today's teams.
-    """
     games = pd.concat([schedule_df["Home"], schedule_df["Away"]]).unique()
     all_rows = []
     for team in games:
@@ -159,10 +152,9 @@ def get_all_lines(schedule_df):
         df.to_csv(os.path.join(DATA_DIR, "lines_today.csv"), index=False)
     return df
 
-# ---------------------------- BUILD PROJECTIONS ----------------------------
+# ---------------- BUILD PROJECTIONS ----------------
 def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
     players = []
-
     source_df = dk_df if not dk_df.empty else nst_df.copy()
     if dk_df.empty:
         print("⚠️ DK salaries not found, building projections without salaries...")
@@ -183,14 +175,6 @@ def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
             role = guess_role(pos)
             fb = SETTINGS["D_fallback"] if role == "D" else SETTINGS["F_fallback"]
             g60,a60,s60,b60 = fb["G60"],fb["A60"],fb["SOG60"],fb["BLK60"]
-
-        # --- Defensive guardrail ---
-        if "Team" not in team_stats.columns:
-            if "Tm" in team_stats.columns:
-                team_stats = team_stats.rename(columns={"Tm": "Team"})
-            else:
-                print("⚠️ Warning: Team column missing in team_stats, projections may be incomplete")
-                continue
 
         opp_stats = team_stats[team_stats.Team == opp]
         sog_factor = (opp_stats["SF/60"].values[0] / FALLBACK_SF60) if not opp_stats.empty else 1.0
@@ -234,14 +218,6 @@ def build_goalies(goalie_df, team_stats, opp_map):
         print("⚠️ No goalie stats found, skipping goalie projections...")
         return pd.DataFrame()
 
-    # Defensive guardrail for goalie team_stats
-    if "Team" not in team_stats.columns:
-        if "Tm" in team_stats.columns:
-            team_stats = team_stats.rename(columns={"Tm": "Team"})
-        else:
-            print("⚠️ Warning: Team column missing in team_stats, skipping goalie projections")
-            return pd.DataFrame()
-
     for _, row in goalie_df.iterrows():
         team = row.get("Team", "")
         if not team: continue
@@ -252,7 +228,7 @@ def build_goalies(goalie_df, team_stats, opp_map):
 
         proj_saves = opp_sf * sv_pct
         proj_ga    = opp_sf * (1 - sv_pct)
-        dk_points  = proj_saves * 0.7 - proj_ga * 3.5  # Example DK goalie scoring
+        dk_points  = proj_saves * 0.7 - proj_ga * 3.5
 
         goalie_dict = {
             "Goalie": row.get("PlayerRaw", row.get("NormName")),
@@ -297,7 +273,7 @@ def build_stacks(dfs_proj):
     df.to_csv(os.path.join(DATA_DIR, "top_stacks.csv"), index=False)
     return df
 
-# ---------------------------- MAIN ----------------------------
+# ---------------- MAIN ----------------
 def main():
     baseline_summary = ingest_baseline_if_needed()
     print("✅ Baseline summary:", baseline_summary)
@@ -317,7 +293,9 @@ def main():
 
     dk_df = load_dk_salaries()
     schedule_df = get_today_schedule()
-    if schedule_df.empty: return
+    if schedule_df.empty:
+        print("ℹ️ Exiting: No games scheduled today.")
+        return
     opp_map = build_opp_map(schedule_df)
 
     print("📊 Fetching NST team stats...")
@@ -328,10 +306,14 @@ def main():
     for team in pd.unique(schedule_df[["Home","Away"]].values.ravel()):
         nst_players.append(nst_scraper.get_team_players(team, CURR_SEASON, tgp=10))
         nst_players.append(nst_scraper.get_team_players(team, CURR_SEASON))
-    nst_df = pd.concat(nst_players, ignore_index=True)
+    nst_df = pd.concat([df for df in nst_players if not df.empty], ignore_index=True)
 
     print("📊 Fetching NST goalie stats...")
-    goalie_df = nst_scraper.get_goalies(CURR_SEASON)
+    try:
+        goalie_df = nst_scraper.get_goalies(CURR_SEASON)
+    except Exception as e:
+        print(f"⚠️ Failed to fetch goalie stats: {e}")
+        goalie_df = pd.DataFrame()
 
     print("📊 Fetching line assignments...")
     lines_df = get_all_lines(schedule_df)
@@ -350,22 +332,25 @@ def main():
     print("📊 Exporting results to Excel...")
     output_path = os.path.join(DATA_DIR, f"projections_{datetime.today().strftime('%Y%m%d')}.xlsx")
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        dfs_proj.to_excel(writer, sheet_name="Skaters", index=False)
-        goalie_proj.to_excel(writer, sheet_name="Goalies", index=False)
-        stack_proj.to_excel(writer, sheet_name="Stacks", index=False)
-        team_stats.to_excel(writer, sheet_name="Teams", index=False)
-        nst_df.to_excel(writer, sheet_name="NST_Raw", index=False)
+        if not dfs_proj.empty: dfs_proj.to_excel(writer, sheet_name="Skaters", index=False)
+        if not goalie_proj.empty: goalie_proj.to_excel(writer, sheet_name="Goalies", index=False)
+        if not stack_proj.empty: stack_proj.to_excel(writer, sheet_name="Stacks", index=False)
+        if not team_stats.empty: team_stats.to_excel(writer, sheet_name="Teams", index=False)
+        if not nst_df.empty: nst_df.to_excel(writer, sheet_name="NST_Raw", index=False)
     print(f"✅ Excel workbook ready: {output_path}")
 
     print("📤 Uploading projections to Google Sheets...")
-    tabs = {
-        "Skaters": dfs_proj,
-        "Goalies": goalie_proj,
-        "Stacks": stack_proj,
-        "Teams": team_stats,
-        "NST_Raw": nst_df
-    }
-    upload_to_sheets("ADP NHL Projections", tabs)
+    tabs = {}
+    if not dfs_proj.empty: tabs["Skaters"] = dfs_proj
+    if not goalie_proj.empty: tabs["Goalies"] = goalie_proj
+    if not stack_proj.empty: tabs["Stacks"] = stack_proj
+    if not team_stats.empty: tabs["Teams"] = team_stats
+    if not nst_df.empty: tabs["NST_Raw"] = nst_df
+
+    if tabs:
+        upload_to_sheets("ADP NHL Projections", tabs)
+    else:
+        print("⚠️ No tabs to upload, skipping Google Sheets push.")
 
 if __name__=="__main__":
     main()
