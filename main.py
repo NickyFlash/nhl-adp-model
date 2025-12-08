@@ -1,237 +1,71 @@
-# main.py
-# -*- coding: utf-8 -*-
-"""
-ADP NHL DFS / Betting Model - Master Script (full)
-Outputs: data/dfs_projections.csv, data/goalies.csv, data/top_stacks.csv and Excel
-"""
-
-import os
-import time
-import json
-import requests
-import pandas as pd
-from datetime import date, datetime
-
-# --- ADP NHL baseline + lineups helpers (assume these exist in your package) ---
-from adp_nhl.utils.etl import ingest_baseline_if_needed
-from adp_nhl.utils.lineups_api import fetch_lineups
-from adp_nhl.utils.joins import join_lineups_with_baseline, load_processed
-from adp_nhl.utils.warnings import tag_missing_baseline, players_missing_baseline
-from adp_nhl.utils.common import norm_name
-from adp_nhl.utils import nst_scraper
-from adp_nhl.utils.export_sheets import upload_to_sheets
-
-# ---------------------------- CONFIG ----------------------------
-DATA_DIR = "data"
-RAW_DIR = os.path.join(DATA_DIR, "raw")
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(RAW_DIR, exist_ok=True)
-
-today = date.today()
-year, month = today.year, today.month
-if month < 7:
-    start, end = year - 1, year
-else:
-    start, end = year, year + 1
-
-CURR_SEASON = f"{start}{end}"
-LAST_SEASON = f"{start-1}{start}"
-
-LEAGUE_AVG_SV = 0.905
-GOALIE_TOI_MIN = 60.0
-
-# Defaults / fallbacks (kept in sync with scraper defaults)
-FALLBACK_SF60, FALLBACK_xGF60 = 31.0, 2.95
-FALLBACK_CA60, FALLBACK_xGA60 = 58.0, 2.65
-
-SETTINGS = {
-    "DK_points": {"Goal": 8.5, "Assist": 5.0, "SOG": 1.5, "Block": 1.3},
-    "LineMult_byType": {
-        "5V5 LINE 1": 1.12, "5V5 LINE 2": 1.04, "5V5 LINE 3": 0.97, "5V5 LINE 4": 0.92,
-        "D PAIR 1": 1.05, "D PAIR 2": 1.00, "D PAIR 3": 0.96,
-        "PP1": 1.12, "PP2": 1.03, "PK1": 0.92, "PK2": 0.95
-    },
-    "F_fallback": {"G60": 0.45, "A60": 0.80, "SOG60": 5.2, "BLK60": 1.0},
-    "D_fallback": {"G60": 0.20, "A60": 0.70, "SOG60": 3.2, "BLK60": 4.0},
-    "sleep_lines": 2.0
-}
-
-def guess_role(pos: str) -> str:
-    if not isinstance(pos, str): return "F"
-    p = pos.upper()
-    if "G" in p: return "G"
-    if "D" in p: return "D"
-    return "F"
-
-# ---------------------------- DRAFTKINGS ----------------------------
-def load_dk_salaries():
-    """
-    Flexible loader for DraftKings CSV formats.
-    Tries to read common DK CSV shapes and returns DataFrame with:
-    Name, TeamAbbrev, Position, Salary, NormName
-    """
-    path = os.path.join(DATA_DIR, "dk_salaries.csv")
-    if not os.path.exists(path):
-        # try common alternate filenames (uploaded by user)
-        for fname in os.listdir(DATA_DIR):
-            if "dk" in fname.lower() and "salary" in fname.lower() and fname.lower().endswith(".csv"):
-                path = os.path.join(DATA_DIR, fname)
-                break
-    if not os.path.exists(path):
-        print("❌ Missing dk_salaries.csv. Download from DraftKings and save to /data/")
-        return pd.DataFrame()
-
-    # read trying common encodings/separators
-    try:
-        df = pd.read_csv(path)
-    except Exception:
-        try:
-            df = pd.read_csv(path, sep=";", engine="python")
-        except Exception as e:
-            print(f"❌ Failed to read dk_salaries: {e}")
-            return pd.DataFrame()
-
-    # If file includes header rows above data, attempt to find starting row by searching for a column header
-    if "Name" not in df.columns and "name" not in [c.lower() for c in df.columns]:
-        # attempt to locate header row (first row with 'Name' text)
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
-        header_row_idx = None
-        for i, line in enumerate(lines[:20]):
-            if "Name" in line or "Position" in line and "Salary" in line:
-                header_row_idx = i
-                break
-        if header_row_idx is not None:
-            try:
-                df = pd.read_csv(path, header=header_row_idx)
-            except Exception:
-                pass
-
-    ren = {}
-    for c in df.columns:
-        lc = c.lower()
-        if lc == "name": ren[c] = "Name"
-        if lc in ("teamabbrev", "team"): ren[c] = "TeamAbbrev"
-        if lc == "position": ren[c] = "Position"
-        if "salary" in lc: ren[c] = "Salary"
-    df = df.rename(columns=ren)
-
-    # If the sheet matches the DK structure you described (players start ~ 8th row and salary ~ 10th column),
-    # we already attempted header detection above. If not, we attempt heuristics:
-    if "Name" not in df.columns:
-        # try to pick a column that has many realistic names (contains space and letters)
-        for c in df.columns:
-            sample = df[c].astype(str).dropna().head(50).tolist()
-            if sum(1 for s in sample if len(s.split()) >= 2) > 10:
-                df = df.rename(columns={c: "Name"})
-                break
-
-    required = ["Name","TeamAbbrev","Position","Salary"]
-    missing = [r for r in required if r not in df.columns]
-    if missing:
-        print("❌ dk_salaries.csv missing columns:", missing)
-        # return partial DataFrame with what we have
-        df["NormName"] = df.get("Name", "").astype(str).apply(norm_name)
-        return df
-
-    # normalize
-    df["NormName"] = df["Name"].astype(str).apply(norm_name)
-    # ensure Salary numeric
-    df["Salary"] = pd.to_numeric(df["Salary"].astype(str).str.replace("[^0-9]", "", regex=True), errors="coerce").fillna(0).astype(int)
-    return df[["Name","TeamAbbrev","Position","Salary","NormName"]]
-
-# ---------------------------- NHL SCHEDULE ----------------------------
+# ---------------------------- SCHEDULE HELPERS ----------------------------
 def get_today_schedule():
     """
-    Pull today's NHL schedule. Try the new api-web endpoint first, then fall back to statsapi.web.nhl.com.
-    Returns DataFrame with columns Home, Away. Empty DF if none.
+    Fetch today's NHL schedule from primary/backup endpoints and write schedule_today.csv.
+    Expected columns in output: Home, Away (team abbreviations).
     """
-    date_str = datetime.today().strftime("%Y-%m-%d")
-
     endpoints = [
-        f"https://api-web.nhle.com/v1/schedule/{date_str}",  # new-ish
-        f"https://statsapi.web.nhl.com/api/v1/schedule?date={date_str}",  # classic
+        "https://adp-nhl-schedule-primary.example.com/today",   # placeholder
+        "https://adp-nhl-schedule-backup.example.com/today",    # placeholder
     ]
     last_exc = None
     for endpoint in endpoints:
         try:
             resp = requests.get(endpoint, timeout=15)
             resp.raise_for_status()
-            js = resp.json()
-            games = []
-            # handle different json schemas
-            if "gameWeek" in js:
-                # new nhle schema
-                gw = js.get("gameWeek", [])
-                if gw:
-                    glist = gw[0].get("games", [])
-                    for g in glist:
-                        home = g.get("homeTeam", {}).get("abbrev") or g.get("homeTeam", {}).get("triCode")
-                        away = g.get("awayTeam", {}).get("abbrev") or g.get("awayTeam", {}).get("triCode")
-                        if home and away:
-                            games.append({"Home": home, "Away": away})
-            elif "dates" in js:
-                # statsapi schema
-                for d in js.get("dates", []):
-                    for g in d.get("games", []):
-                        home = g.get("teams", {}).get("home", {}).get("team", {}).get("abbreviation") or g.get("teams", {}).get("home", {}).get("team", {}).get("triCode")
-                        away = g.get("teams", {}).get("away", {}).get("team", {}).get("abbreviation") or g.get("teams", {}).get("away", {}).get("team", {}).get("triCode")
-                        # fallback: use team id -> map later if needed
-                        if not home:
-                            try:
-                                home = g["teams"]["home"]["team"]["name"][:3].upper()
-                            except Exception:
-                                home = None
-                        if not away:
-                            try:
-                                away = g["teams"]["away"]["team"]["name"][:3].upper()
-                            except Exception:
-                                away = None
-                        if home and away:
-                            games.append({"Home": home, "Away": away})
-            else:
-                # try other plausible shapes
-                if isinstance(js, dict):
-                    # try to find any games list
-                    maybe_games = js.get("games") or js.get("data") or js.get("game")
-                    if isinstance(maybe_games, list):
-                        for g in maybe_games:
-                            home = (g.get("homeTeam") or g.get("home") or {}).get("abbrev") if isinstance(g, dict) else None
-                            away = (g.get("awayTeam") or g.get("away") or {}).get("abbrev") if isinstance(g, dict) else None
-                            if home and away:
-                                games.append({"Home": home, "Away": away})
-
+            games = resp.json()
+            if isinstance(games, dict):
+                games = games.get("games", [])
             df = pd.DataFrame(games)
             if df.empty:
                 print("ℹ️ No NHL games today (from endpoint):", endpoint)
             else:
+                # Ensure expected columns exist
+                col_map = {}
+                if "home" in df.columns and "away" in df.columns:
+                    col_map = {"home": "Home", "away": "Away"}
+                elif "HOME" in df.columns and "AWAY" in df.columns:
+                    col_map = {"HOME": "Home", "AWAY": "Away"}
+                df = df.rename(columns=col_map)
+                if "Home" not in df.columns or "Away" not in df.columns:
+                    print("⚠️ Schedule dataframe missing Home/Away columns, got:", df.columns.tolist())
                 df.to_csv(os.path.join(DATA_DIR, "schedule_today.csv"), index=False)
             return df
         except Exception as e:
             last_exc = e
-            # small backoff and try next endpoint
             time.sleep(1)
             continue
-
     print("⚠️ Schedule fetch failed (both endpoints). Last error:", last_exc)
     return pd.DataFrame()
 
+
 def build_opp_map(schedule_df: pd.DataFrame):
+    """
+    Build a mapping team -> opponent from schedule_df.
+    Requires columns Home, Away.
+    """
     opp = {}
+    if schedule_df is None or schedule_df.empty:
+        return opp
     for _, g in schedule_df.iterrows():
+        if "Home" not in g or "Away" not in g:
+            continue
         h, a = g["Home"], g["Away"]
+        if pd.isna(h) or pd.isna(a):
+            continue
         opp[h], opp[a] = a, h
     return opp
+
 
 # ---------------------------- LINE ASSIGNMENTS (Option A) ----------------------------
 def get_all_lines(schedule_df):
     """
     Pull line/shift assignment data for today's teams from the lineups endpoint (Option A).
-    This function is defensive: accepts a few JSON shapes and always returns DataFrame with:
-    Team, Assignment, PlayerRaw, NormName
+    Always returns DataFrame with columns:
+        Team, Assignment, PlayerRaw, NormName
     """
     if schedule_df is None or schedule_df.empty:
-        return pd.DataFrame(columns=["Team","Assignment","PlayerRaw","NormName"])
+        return pd.DataFrame(columns=["Team", "Assignment", "PlayerRaw", "NormName"])
 
     # gather unique team abbreviations playing today
     games = pd.concat([schedule_df["Home"], schedule_df["Away"]]).unique()
@@ -239,56 +73,74 @@ def get_all_lines(schedule_df):
 
     for team in games:
         try:
-            # example: https://vhd27npae1.execute-api.us-east-1.amazonaws.com/lineups/{team}
-            url = f"https://vhd27npae1.execute-api.us-east-1.amazonaws.com/lineups/{team}"
+            url = "https://vhd27npae1.execute-api.us-east-1.amazonaws.com/lineups/" + str(team)
             resp = requests.get(url, timeout=15)
             resp.raise_for_status()
             js = resp.json()
 
-            # defensive: sometimes the top-level is a list or dict
             if isinstance(js, list):
-                # try to find the first dict that looks like line data
                 js = js[0] if js else {}
 
-            # collect forwards and defense lists under possibly different keys
             forwards = js.get("forwards") or js.get("fwd") or js.get("forwardsLines") or []
             defense = js.get("defense") or js.get("def") or js.get("defensePairs") or []
             goalies = js.get("goalies") or js.get("goalie") or []
 
-            # some endpoints return a 'lines' list with nested dictionaries
-            if not forwards and "lines" in js and isinstance(js["lines"], list):
+            # handle generic 'lines' key
+            if (not forwards) and ("lines" in js) and isinstance(js["lines"], list):
                 for item in js["lines"]:
                     if not isinstance(item, dict):
                         continue
-                    # each item may contain 'type' and 'players'
                     atype = item.get("type") or item.get("line") or item.get("situation")
                     players = item.get("players") or item.get("names") or []
                     for p in players:
                         name = p.get("name") if isinstance(p, dict) else str(p)
-                        all_rows.append({"Team": team, "Assignment": atype or "LINE", "PlayerRaw": name, "NormName": norm_name(name)})
+                        all_rows.append(
+                            {
+                                "Team": team,
+                                "Assignment": atype or "LINE",
+                                "PlayerRaw": name,
+                                "NormName": norm_name(name),
+                            }
+                        )
 
             # standard forwards/defense handling
             for line in forwards + defense:
-                # line may be dict ('line': '5V5 LINE 1', 'players':[...]) or a list of dicts
                 if isinstance(line, dict):
-                    assignment = line.get("line") or line.get("type") or line.get("situation") or "LINE"
+                    assignment = (
+                        line.get("line")
+                        or line.get("type")
+                        or line.get("situation")
+                        or "LINE"
+                    )
                     players = line.get("players") or line.get("playerList") or []
                     for p in players:
                         if isinstance(p, dict):
                             name = p.get("name") or p.get("player") or ""
                         else:
                             name = str(p)
-                        all_rows.append({"Team": team, "Assignment": assignment, "PlayerRaw": name, "NormName": norm_name(name)})
+                        all_rows.append(
+                            {
+                                "Team": team,
+                                "Assignment": assignment,
+                                "PlayerRaw": name,
+                                "NormName": norm_name(name),
+                            }
+                        )
                 elif isinstance(line, list):
-                    # a list of player dicts or names
                     for p in line:
                         if isinstance(p, dict):
                             name = p.get("name") or p.get("player") or ""
                         else:
                             name = str(p)
-                        all_rows.append({"Team": team, "Assignment": "LINE", "PlayerRaw": name, "NormName": norm_name(name)})
+                        all_rows.append(
+                            {
+                                "Team": team,
+                                "Assignment": "LINE",
+                                "PlayerRaw": name,
+                                "NormName": norm_name(name),
+                            }
+                        )
                 else:
-                    # unknown shape: string maybe
                     continue
 
             # goalies
@@ -297,26 +149,57 @@ def get_all_lines(schedule_df):
                     name = g.get("name") or g.get("player") or ""
                 else:
                     name = str(g)
-                all_rows.append({"Team": team, "Assignment": "Goalie", "PlayerRaw": name, "NormName": norm_name(name)})
+                all_rows.append(
+                    {
+                        "Team": team,
+                        "Assignment": "Goalie",
+                        "PlayerRaw": name,
+                        "NormName": norm_name(name),
+                    }
+                )
 
-            # small sleep to be polite
             time.sleep(SETTINGS["sleep_lines"])
-
         except Exception as e:
-            print(f"⚠️ Failed to fetch lines for {team}: {e}")
+            print("⚠️ Failed to fetch lines for " + str(team) + ": " + str(e))
             continue
 
     df = pd.DataFrame(all_rows)
-    # make sure expected columns exist
+
     if df.empty:
-        return pd.DataFrame(columns=["Team","Assignment","PlayerRaw","NormName"])
-    # unify assignment text
+        return pd.DataFrame(columns=["Team", "Assignment", "PlayerRaw", "NormName"])
+
+    # unify assignment text and make sure columns exist
     df["Assignment"] = df["Assignment"].astype(str).str.strip().str.upper()
+
+    if "NormName" not in df.columns:
+        df["NormName"] = df["PlayerRaw"].astype(str).apply(norm_name)
+
     df.to_csv(os.path.join(DATA_DIR, "lines_today.csv"), index=False)
     return df
 
-# ---------------------------- BUILD PROJECTIONS ----------------------------
+
+# ---------------------------- PROJECTION HELPERS ----------------------------
+def safe_get_from_series(s, keys):
+    """
+    Robustly try to get a float value from a pandas Series using multiple alternative keys.
+    """
+    for k in keys:
+        if k in s and pd.notna(s[k]):
+            try:
+                return float(s[k])
+            except Exception:
+                try:
+                    return float(str(s[k]).replace(",", ""))
+                except Exception:
+                    return None
+    return None
+
+
 def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
+    """
+    Build skater projections using DK salaries (if available), NST per-60 data, team context, and line assignments.
+    """
+
     players = []
 
     # choose source list: prefer DK salary file (current slate) else use NST players (season list)
@@ -325,28 +208,58 @@ def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
         print("⚠️ No source players available for building skaters.")
         return pd.DataFrame()
 
-    # ensure team_stats has Team column
-    if "Team" not in team_stats.columns:
-        print("⚠️ Warning: Team column missing in team_stats, using fallbacks")
+    # normalize team_stats columns
+    if team_stats is None:
+        team_stats = pd.DataFrame()
+    else:
         team_stats = team_stats.copy()
+    if "Team" not in team_stats.columns:
         team_stats["Team"] = team_stats.get("Team", team_stats.index.astype(str))
+    # standardize SF/xGA columns
+    col_rename = {}
+    for c in team_stats.columns:
+        if c.lower() in ["sf60", "sf_60", "shotsfor60", "shots_for_60"]:
+            col_rename[c] = "SF/60"
+        if c.lower() in ["xga60", "xga_60", "xga_per_60"]:
+            col_rename[c] = "xGA/60"
+    team_stats = team_stats.rename(columns=col_rename)
 
     # lines_df guard
     if lines_df is None:
-        lines_df = pd.DataFrame(columns=["Team","Assignment","PlayerRaw","NormName"])
-    # ensure NormName exists in lines_df
+        lines_df = pd.DataFrame(columns=["Team", "Assignment", "PlayerRaw", "NormName"])
+    else:
+        lines_df = lines_df.copy()
+
     if "NormName" not in lines_df.columns:
         lines_df["NormName"] = lines_df["PlayerRaw"].astype(str).apply(norm_name)
 
+    # ensure NST has NormName
+    if nst_df is None:
+        nst_df = pd.DataFrame()
+    else:
+        nst_df = nst_df.copy()
+    if (not nst_df.empty) and ("NormName" not in nst_df.columns):
+        name_col = "Player"
+        if "Player Name" in nst_df.columns:
+            name_col = "Player Name"
+        if "Name" in nst_df.columns:
+            name_col = "Name"
+        nst_df["NormName"] = nst_df[name_col].astype(str).apply(norm_name)
+
     for _, row in source_df.iterrows():
-        nm = row.get("NormName") or norm_name(row.get("Name") or row.get("PlayerRaw") or "")
-        team = row.get("TeamAbbrev") if "TeamAbbrev" in row else row.get("Team") or row.get("team") or ""
+        nm = row.get("NormName")
+        if not nm:
+            nm = norm_name(row.get("Name") or row.get("PlayerRaw") or "")
+
+        team = row.get("TeamAbbrev") if "TeamAbbrev" in row else (row.get("Team") or row.get("team") or "")
         pos = row.get("Position", "F")
+
         if isinstance(team, float) and pd.isna(team):
             team = ""
+
         opp = opp_map.get(team) if team else None
 
-        # find NST per-60 row
+        # find NST per-60 row by NormName
         nst_row = pd.DataFrame()
         try:
             if nst_df is not None and not nst_df.empty:
@@ -355,52 +268,80 @@ def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
             nst_row = pd.DataFrame()
 
         if not nst_row.empty:
-            # reading via pandas .get may not work; access by column key safely
-            g60 = safe_get_from_series(nst_row.iloc[0], ["G/60","G60","G"])
-            a60 = safe_get_from_series(nst_row.iloc[0], ["A/60","A60","A"])
-            s60 = safe_get_from_series(nst_row.iloc[0], ["SOG/60","S/60","SOG","S"])
-            b60 = safe_get_from_series(nst_row.iloc[0], ["BLK/60","BLK","BLK/60"])
+            row0 = nst_row.iloc[0]
+            g60 = safe_get_from_series(row0, ["G/60", "G60", "G_per60", "G"])
+            a60 = safe_get_from_series(row0, ["A/60", "A60", "A_per60", "A"])
+            s60 = safe_get_from_series(row0, ["SOG/60", "S/60", "SOG60", "SOG", "S"])
+            b60 = safe_get_from_series(row0, ["BLK/60", "BLK60", "BLK"])
         else:
             role = guess_role(pos)
             fb = SETTINGS["D_fallback"] if role == "D" else SETTINGS["F_fallback"]
-            g60,a60,s60,b60 = fb["G60"],fb["A60"],fb["SOG60"],fb["BLK60"]
+            g60, a60, s60, b60 = fb["G60"], fb["A60"], fb["SOG60"], fb["BLK60"]
 
         # team defensive context
-        opp_stats = team_stats[team_stats.Team == opp] if (opp is not None and not team_stats.empty) else pd.DataFrame()
-        sog_factor = (float(opp_stats["SF/60"].values[0]) / FALLBACK_SF60) if (not opp_stats.empty and "SF/60" in opp_stats.columns and pd.notna(opp_stats["SF/60"].values[0])) else 1.0
-        xga_factor = (float(opp_stats["xGA/60"].values[0]) / FALLBACK_xGA60) if (not opp_stats.empty and "xGA/60" in opp_stats.columns and pd.notna(opp_stats["xGA/60"].values[0])) else 1.0
+        if opp is not None and (not team_stats.empty):
+            opp_stats = team_stats[team_stats["Team"] == opp]
+        else:
+            opp_stats = pd.DataFrame()
+
+        if (not opp_stats.empty) and ("SF/60" in opp_stats.columns) and pd.notna(opp_stats["SF/60"].values[0]):
+            sog_factor = float(opp_stats["SF/60"].values[0]) / float(FALLBACK_SF60)
+        else:
+            sog_factor = 1.0
+
+        if (not opp_stats.empty) and ("xGA/60" in opp_stats.columns) and pd.notna(opp_stats["xGA/60"].values[0]):
+            xga_factor = float(opp_stats["xGA/60"].values[0]) / float(FALLBACK_xGA60)
+        else:
+            xga_factor = 1.0
 
         # line multiplier from lines_df
-        line_row = lines_df[(lines_df.NormName == nm) & (lines_df.Team == team)]
-        line_info = line_row["Assignment"].iloc[0] if not line_row.empty else "NA"
-        line_mult = SETTINGS["LineMult_byType"].get(line_info, 1.0)
+        if team and (not lines_df.empty):
+            line_row = lines_df[(lines_df["NormName"] == nm) & (lines_df["Team"] == team)]
+        else:
+            line_row = pd.DataFrame()
 
-        proj_goals  = (g60 or 0.0) * xga_factor * line_mult
-        proj_assists= (a60 or 0.0) * xga_factor * line_mult
-        proj_sog    = (s60 or 0.0) * sog_factor * line_mult
+        line_info = line_row["Assignment"].iloc[0] if not line_row.empty else "NA"
+        # Settings expected to have entries like "5V5 LINE 1", "5V5 LINE 2", "PP1", etc. (uppercased).
+        line_info_std = str(line_info).upper().strip()
+        line_mult = SETTINGS["LineMult_byType"].get(line_info_std, 1.0)
+
+        proj_goals = (g60 or 0.0) * xga_factor * line_mult
+        proj_assists = (a60 or 0.0) * xga_factor * line_mult
+        proj_sog = (s60 or 0.0) * sog_factor * line_mult
         proj_blocks = (b60 or 0.0) * line_mult
 
-        dk_points = (proj_goals*SETTINGS["DK_points"]["Goal"] +
-                     proj_assists*SETTINGS["DK_points"]["Assist"] +
-                     proj_sog*SETTINGS["DK_points"]["SOG"] +
-                     proj_blocks*SETTINGS["DK_points"]["Block"])
+        dk_points = (
+            proj_goals * SETTINGS["DK_points"]["Goal"]
+            + proj_assists * SETTINGS["DK_points"]["Assist"]
+            + proj_sog * SETTINGS["DK_points"]["SOG"]
+            + proj_blocks * SETTINGS["DK_points"]["Block"]
+        )
 
         player_dict = {
             "Player": row.get("Name") or row.get("PlayerRaw") or nm,
+            "NormName": nm,
             "Team": team,
             "Opponent": opp or "",
             "Position": pos,
-            "Line": line_info,
+            "Line": line_info_std,
             "Proj Goals": round(proj_goals, 3),
             "Proj Assists": round(proj_assists, 3),
             "Proj SOG": round(proj_sog, 3),
             "Proj Blocks": round(proj_blocks, 3),
-            "DK Points": round(dk_points, 3)
+            "DK Points": round(dk_points, 3),
         }
 
-        if (dk_df is not None) and ("Salary" in row and pd.notna(row["Salary"])):
-            player_dict["Salary"] = int(row["Salary"])
-            player_dict["DFS Value Score"] = round((dk_points / (row["Salary"] or 1)) * 1000, 3)
+        if (dk_df is not None) and ("Salary" in row) and pd.notna(row["Salary"]):
+            try:
+                sal = int(row["Salary"])
+            except Exception:
+                try:
+                    sal = int(str(row["Salary"]).replace(",", ""))
+                except Exception:
+                    sal = 0
+            player_dict["Salary"] = sal
+            if sal > 0:
+                player_dict["DFS Value Score"] = round((dk_points / float(sal)) * 1000.0, 3)
 
         players.append(player_dict)
 
@@ -408,53 +349,63 @@ def build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map):
     out_df.to_csv(os.path.join(DATA_DIR, "dfs_projections.csv"), index=False)
     return out_df
 
-def safe_get_from_series(s, keys):
-    for k in keys:
-        if k in s and pd.notna(s[k]):
-            try:
-                return float(s[k])
-            except Exception:
-                try:
-                    return float(str(s[k]).replace(",",""))
-                except Exception:
-                    return None
-    return None
 
 def build_goalies(goalie_df, team_stats, opp_map):
+    """
+    Build goalie projections using blended SV% and opponent SF/60 context.
+    """
+
     goalies = []
     if goalie_df is None or goalie_df.empty:
         print("⚠️ No goalie stats found, skipping goalie projections...")
         return pd.DataFrame()
 
-    # ensure Team column in team_stats for lookups
+    if team_stats is None:
+        team_stats = pd.DataFrame()
+    else:
+        team_stats = team_stats.copy()
     if "Team" not in team_stats.columns:
         team_stats["Team"] = team_stats.get("Team", team_stats.index.astype(str))
 
+    # normalize SF column
+    col_rename = {}
+    for c in team_stats.columns:
+        if c.lower() in ["sf60", "sf_60", "shotsfor60", "shots_for_60"]:
+            col_rename[c] = "SF/60"
+    team_stats = team_stats.rename(columns=col_rename)
+
     for _, row in goalie_df.iterrows():
-        pname = row.get("PlayerRaw") or row.get("NormName")
-        team = row.get("Team") or ""
-        # if team not present in goalie_df, try to infer from players file (not implemented here)
+        pname = row.get("PlayerRaw") or row.get("NormName") or row.get("Player") or ""
+        team = row.get("Team") or row.get("TeamAbbrev") or ""
+
         if not team:
-            # best-effort: skip if no team
             continue
+
         opp = opp_map.get(team, "")
-        # Use blended SV% if available (season/recent/last)
-        sv_season = safe_get_from_series(row, ["SV_season","SV%","SV_season"])
+
+        # blended SV%
+        sv_season = safe_get_from_series(row, ["SV_season", "SV%", "SV_season"])
         sv_recent = safe_get_from_series(row, ["SV_recent"])
-        sv_last   = safe_get_from_series(row, ["SV_last"])
-        # Blend: prefer recent (weight 0.6), then season 0.3, last 0.1
-        sv_pct = ( (sv_recent or 0)*0.6 + (sv_season or LEAGUE_AVG_SV)*0.3 + (sv_last or 0)*0.1 )
-        if sv_pct == 0:
+        sv_last = safe_get_from_series(row, ["SV_last"])
+
+        sv_pct = ( (sv_recent or 0) * 0.6 + (sv_season or LEAGUE_AVG_SV) * 0.3 + (sv_last or 0) * 0.1 )
+        if not sv_pct:
             sv_pct = LEAGUE_AVG_SV
 
-        opp_stats = team_stats[team_stats.Team == opp] if (not team_stats.empty and opp) else pd.DataFrame()
-        opp_sf = (opp_stats["SF/60"].values[0] if (not opp_stats.empty and "SF/60" in opp_stats.columns and pd.notna(opp_stats["SF/60"].values[0])) else FALLBACK_SF60)
+        if (not team_stats.empty) and opp:
+            opp_stats = team_stats[team_stats["Team"] == opp]
+        else:
+            opp_stats = pd.DataFrame()
 
-        # Project saves roughly: opp shots for * sv_pct * game_minutes/60
+        if (not opp_stats.empty) and ("SF/60" in opp_stats.columns) and pd.notna(opp_stats["SF/60"].values[0]):
+            opp_sf = float(opp_stats["SF/60"].values[0])
+        else:
+            opp_sf = float(FALLBACK_SF60)
+
         proj_saves = opp_sf * sv_pct
-        proj_ga    = opp_sf * (1 - sv_pct)
-        # example DK scoring for goalies (you may tune)
-        dk_points  = proj_saves * 0.7 - proj_ga * 3.5
+        proj_ga = opp_sf * (1.0 - sv_pct)
+
+        dk_points = proj_saves * 0.7 - proj_ga * 3.5
 
         goalie_dict = {
             "Goalie": pname,
@@ -462,7 +413,7 @@ def build_goalies(goalie_df, team_stats, opp_map):
             "Opponent": opp,
             "Proj Saves": round(proj_saves, 2),
             "Proj GA": round(proj_ga, 2),
-            "DK Points": round(dk_points, 3)
+            "DK Points": round(dk_points, 3),
         }
         goalies.append(goalie_dict)
 
@@ -470,7 +421,12 @@ def build_goalies(goalie_df, team_stats, opp_map):
     df.to_csv(os.path.join(DATA_DIR, "goalies.csv"), index=False)
     return df
 
+
 def build_stacks(dfs_proj):
+    """
+    Aggregate skater projections into stacks by Team + Line.
+    """
+
     stacks = []
     if dfs_proj is None or dfs_proj.empty:
         print("⚠️ No skater projections available, skipping stacks...")
@@ -478,24 +434,29 @@ def build_stacks(dfs_proj):
 
     for team, grp in dfs_proj.groupby("Team"):
         for line, players in grp.groupby("Line"):
-            if not line or line == "NA": continue
+            if not line or line == "NA":
+                continue
+
             pts = players["DK Points"].sum()
             stack_dict = {
                 "Team": team,
                 "Line": line,
                 "Players": ", ".join(players["Player"].astype(str).tolist()),
-                "ProjPts": round(pts, 3)
+                "ProjPts": round(pts, 3),
             }
+
             if "Salary" in players.columns:
                 cost = players["Salary"].sum()
-                val = (pts / cost * 1000) if cost > 0 else 0
+                val = (pts / cost * 1000.0) if cost > 0 else 0
                 stack_dict["Cost"] = int(cost)
                 stack_dict["StackValue"] = round(val, 3)
+
             stacks.append(stack_dict)
 
     df = pd.DataFrame(stacks)
     df.to_csv(os.path.join(DATA_DIR, "top_stacks.csv"), index=False)
     return df
+
 
 # ---------------------------- MAIN ----------------------------
 def main():
@@ -515,13 +476,12 @@ def main():
 
     print("🚀 Starting ADP NHL DFS Model")
 
-    # load DK salaries (optional)
+    # DraftKings salaries (optional but preferred source)
     dk_df = load_dk_salaries()
 
-    # schedule
+    # Schedule + opponent map
     schedule_df = get_today_schedule()
     if schedule_df.empty:
-        # still continue if user wants outputs from past data, but here we stop
         print("ℹ️ No schedule entries for today; stopping.")
         return
     opp_map = build_opp_map(schedule_df)
@@ -532,31 +492,45 @@ def main():
     if team_stats.empty:
         print("⚠️ team_stats empty - projections will use fallbacks.")
 
-    # NST player stats (use schedule teams to limit calls)
+    # NST player stats (skaters) – last-10 + season for teams playing today
     print("📊 Fetching NST skater stats...")
     nst_players = []
-    # pull last-10 and season splits for teams playing today
-    teams_today = pd.unique(schedule_df[["Home","Away"]].values.ravel())
+    teams_today = pd.unique(schedule_df[["Home", "Away"]].values.ravel())
     for team in teams_today:
         try:
             nst_players.append(nst_scraper.get_team_players(team, CURR_SEASON, tgp=10))
             nst_players.append(nst_scraper.get_team_players(team, CURR_SEASON))
         except Exception as e:
-            print(f"⚠️ NST skater fetch failed for {team}: {e}")
+            print("⚠️ NST skater fetch failed for " + str(team) + ": " + str(e))
+
     if nst_players:
         try:
-            nst_df = pd.concat(nst_players, ignore_index=True).drop_duplicates(subset=["NormName"], keep="first")
+            nst_df = pd.concat(nst_players, ignore_index=True)
+            if "NormName" in nst_df.columns:
+                nst_df = nst_df.drop_duplicates(subset=["NormName"], keep="first")
+            else:
+                # create NormName from best-available player name column then dedupe
+                name_col = "Player"
+                if "Player Name" in nst_df.columns:
+                    name_col = "Player Name"
+                if "Name" in nst_df.columns:
+                    name_col = "Name"
+                nst_df["NormName"] = nst_df[name_col].astype(str).apply(norm_name)
+                nst_df = nst_df.drop_duplicates(subset=["NormName"], keep="first")
         except Exception:
             nst_df = pd.DataFrame()
     else:
         nst_df = pd.DataFrame()
 
+    # NST goalie stats
     print("📊 Fetching NST goalie stats...")
     goalie_df = nst_scraper.get_goalies(CURR_SEASON)
 
+    # Line assignments
     print("📊 Fetching line assignments...")
     lines_df = get_all_lines(schedule_df)
 
+    # Projections
     print("🛠️ Building skater projections...")
     dfs_proj = build_skaters(dk_df, nst_df, team_stats, lines_df, opp_map)
 
@@ -568,21 +542,23 @@ def main():
 
     print("✅ All outputs saved to /data")
 
-    # Save Excel workbook
+    # Excel export
     try:
         print("📊 Exporting results to Excel...")
-        output_path = os.path.join(DATA_DIR, f"projections_{datetime.today().strftime('%Y%m%d')}.xlsx")
+        output_path = os.path.join(
+            DATA_DIR, "projections_" + datetime.today().strftime("%Y%m%d") + ".xlsx"
+        )
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             dfs_proj.to_excel(writer, sheet_name="Skaters", index=False)
             goalie_proj.to_excel(writer, sheet_name="Goalies", index=False)
             stack_proj.to_excel(writer, sheet_name="Stacks", index=False)
             team_stats.to_excel(writer, sheet_name="Teams", index=False)
             nst_df.to_excel(writer, sheet_name="NST_Raw", index=False)
-        print(f"✅ Excel workbook ready: {output_path}")
+        print("✅ Excel workbook ready: " + output_path)
     except Exception as e:
         print("⚠️ Excel export failed:", e)
 
-    # Upload to Google Sheets (optional — requires GCP_CREDENTIALS env)
+    # Google Sheets export (optional)
     try:
         print("📤 Uploading projections to Google Sheets...")
         tabs = {
@@ -590,11 +566,12 @@ def main():
             "Goalies": goalie_proj,
             "Stacks": stack_proj,
             "Teams": team_stats,
-            "NST_Raw": nst_df
+            "NST_Raw": nst_df,
         }
         upload_to_sheets("ADP NHL Projections", tabs)
     except Exception as e:
         print("⚠️ Upload to Google Sheets failed:", e)
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
